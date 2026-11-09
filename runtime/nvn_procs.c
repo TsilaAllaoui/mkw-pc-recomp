@@ -8,6 +8,7 @@
 
 #include "gfx.h"
 #include "host.h"
+#include "cfg.h"
 #include "platform/platform.h"
 
 // The strong nvnp_nvnDeviceGetProcAddress below replaces the stand-in generated for the same row.
@@ -26,6 +27,193 @@
 #undef NVN_PROC
 #undef nvnp_nvnDeviceGetProcAddress
 void nvnp_nvnDeviceGetProcAddress(Cpu *c);
+/* DKB_GRAPHICS_MILESTONES_M12: opt-in reporting of FIRST invocation only; no shader or API state modified. */
+static void dkb_gfx_nvnDeviceInitialize(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone DEVICE_INIT CALL nvnDeviceInitialize x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnDeviceInitialize(c);
+    if (log_this)
+        rt_log("DKB GFX milestone DEVICE_INIT RETURN nvnDeviceInitialize x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+static void dkb_gfx_nvnQueueInitialize(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone QUEUE_INIT CALL nvnQueueInitialize x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnQueueInitialize(c);
+    if (log_this)
+        rt_log("DKB GFX milestone QUEUE_INIT RETURN nvnQueueInitialize x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+static void dkb_gfx_nvnWindowInitialize(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone WINDOW_INIT CALL nvnWindowInitialize x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnWindowInitialize(c);
+    if (log_this)
+        rt_log("DKB GFX milestone WINDOW_INIT RETURN nvnWindowInitialize x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+static void dkb_gfx_nvnProgramSetShaders(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone SHADER_SET CALL nvnProgramSetShaders x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnProgramSetShaders(c);
+    if (log_this)
+        rt_log("DKB GFX milestone SHADER_SET RETURN nvnProgramSetShaders x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+static void dkb_gfx_nvnProgramSetShadersExt(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone SHADER_SET_EXT CALL nvnProgramSetShadersExt x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnProgramSetShadersExt(c);
+    if (log_this)
+        rt_log("DKB GFX milestone SHADER_SET_EXT RETURN nvnProgramSetShadersExt x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+static void dkb_gfx_nvnCommandBufferBindProgram(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone PROGRAM_BIND CALL nvnCommandBufferBindProgram x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnCommandBufferBindProgram(c);
+    if (log_this)
+        rt_log("DKB GFX milestone PROGRAM_BIND RETURN nvnCommandBufferBindProgram x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+static void dkb_gfx_nvnWindowAcquireTexture(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone SWAPCHAIN_ACQUIRE CALL nvnWindowAcquireTexture x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnWindowAcquireTexture(c);
+    if (log_this)
+        rt_log("DKB GFX milestone SWAPCHAIN_ACQUIRE RETURN nvnWindowAcquireTexture x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+static void dkb_gfx_nvnCommandBufferDrawArrays(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone DRAW_ARRAYS CALL nvnCommandBufferDrawArrays x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnCommandBufferDrawArrays(c);
+    if (log_this)
+        rt_log("DKB GFX milestone DRAW_ARRAYS RETURN nvnCommandBufferDrawArrays x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+static void dkb_gfx_nvnCommandBufferDrawElements(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone DRAW_ELEMENTS CALL nvnCommandBufferDrawElements x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnCommandBufferDrawElements(c);
+    if (log_this)
+        rt_log("DKB GFX milestone DRAW_ELEMENTS RETURN nvnCommandBufferDrawElements x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+static void dkb_gfx_nvnCommandBufferDispatchCompute(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone DISPATCH_COMPUTE CALL nvnCommandBufferDispatchCompute x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnCommandBufferDispatchCompute(c);
+    if (log_this)
+        rt_log("DKB GFX milestone DISPATCH_COMPUTE RETURN nvnCommandBufferDispatchCompute x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+static void dkb_gfx_nvnQueueSubmitCommands(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone COMMAND_SUBMIT CALL nvnQueueSubmitCommands x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnQueueSubmitCommands(c);
+    if (log_this)
+        rt_log("DKB GFX milestone COMMAND_SUBMIT RETURN nvnQueueSubmitCommands x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+static void dkb_gfx_nvnQueuePresentTexture(Cpu *c) {
+    static volatile int32_t first;
+    int log_this = !__atomic_exchange_n(&first, 1, __ATOMIC_RELAXED);
+    const char *flag = log_this ? cfg_get("DKB_GFX_TRACE") : NULL;
+    log_this = log_this && flag && !strcmp(flag, "1");
+    if (log_this)
+        rt_log("DKB GFX milestone PRESENT_REQUEST CALL nvnQueuePresentTexture x0=%#llx x1=%#llx x2=%#llx",
+               (unsigned long long)c->x[0], (unsigned long long)c->x[1],
+               (unsigned long long)c->x[2]);
+    nvnp_nvnQueuePresentTexture(c);
+    if (log_this)
+        rt_log("DKB GFX milestone PRESENT_REQUEST RETURN nvnQueuePresentTexture x0_after=%#llx (not proof of a frame)",
+               (unsigned long long)c->x[0]);
+}
+/* Weak NVN stubs remain fatal; unknown procedure names still return NULL. */
+static void (*dkb_gfx_proc(const char *name, void (*original)(Cpu *)))(Cpu *) {
+
+    if (!strcmp(name, "nvnDeviceInitialize")) return dkb_gfx_nvnDeviceInitialize;
+    if (!strcmp(name, "nvnQueueInitialize")) return dkb_gfx_nvnQueueInitialize;
+    if (!strcmp(name, "nvnWindowInitialize")) return dkb_gfx_nvnWindowInitialize;
+    if (!strcmp(name, "nvnProgramSetShaders")) return dkb_gfx_nvnProgramSetShaders;
+    if (!strcmp(name, "nvnProgramSetShadersExt")) return dkb_gfx_nvnProgramSetShadersExt;
+    if (!strcmp(name, "nvnCommandBufferBindProgram")) return dkb_gfx_nvnCommandBufferBindProgram;
+    if (!strcmp(name, "nvnWindowAcquireTexture")) return dkb_gfx_nvnWindowAcquireTexture;
+    if (!strcmp(name, "nvnCommandBufferDrawArrays")) return dkb_gfx_nvnCommandBufferDrawArrays;
+    if (!strcmp(name, "nvnCommandBufferDrawElements")) return dkb_gfx_nvnCommandBufferDrawElements;
+    if (!strcmp(name, "nvnCommandBufferDispatchCompute")) return dkb_gfx_nvnCommandBufferDispatchCompute;
+    if (!strcmp(name, "nvnQueueSubmitCommands")) return dkb_gfx_nvnQueueSubmitCommands;
+    if (!strcmp(name, "nvnQueuePresentTexture")) return dkb_gfx_nvnQueuePresentTexture;
+    return original;
+}
+
 
 typedef struct { const char *name; uint64_t addr; } Proc;
 
@@ -42,7 +230,7 @@ static int by_name(const void *a, const void *b) { return strcmp(((const Proc *)
 
 void nvn_procs_register(void) {
     if (nprocs) return;
-#define NVN_PROC(n) procs[nprocs++] = (Proc){#n, hostfn_register("nvn:" #n, nvnp_##n)};
+#define NVN_PROC(n) procs[nprocs++] = (Proc){#n, hostfn_register("nvn:" #n, dkb_gfx_proc(#n, nvnp_##n))};
 #include "nvn_procs.inc"
 #undef NVN_PROC
     qsort(procs, (size_t)nprocs, sizeof *procs, by_name);

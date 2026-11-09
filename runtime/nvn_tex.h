@@ -10,6 +10,9 @@ uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level);
 int nvn_fmt_bpb(int format, int *bw, int *bh);   // Bytes per block (0 = unknown format), block width and height
 // Block height / block depth actually used by level `level` (log2 of the GOB count): the per-level block height shrinks with that level's row count (block rows), and deswizzling uses it level by level
 void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, unsigned *tileD);
+// A sparse 2D or 2D-array block-linear texture: 1 with the shape of its 64 KiB tile in blocks and the tile's block
+// height (log2 GOBs); 0 for every other texture. See nvn_tex.c for the layout rules that follow from it.
+int nvn_tex_sparse_tile(const nvn_texdesc *d, uint32_t *tw, uint32_t *th, unsigned *gob_h);
 
 /* LINEAR_RENDER_TARGET (0x40) uses pitch storage even without LINEAR (0x10).
    TOTK's CPU-loaded water height/mask textures use that flag alone. */

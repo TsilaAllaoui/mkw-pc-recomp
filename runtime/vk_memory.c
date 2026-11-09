@@ -43,9 +43,17 @@ typedef struct PoolRec {
     VkBuffer buf;
     VkDeviceMemory mem;                // POOL_IMPORT
     VmaAllocation alloc;               // POOL_PHYS
+    // M15.23: immutable Vulkan backing fields captured after allocation, not queried while holding pool_lock.
+    // These are only descriptions: an external snapshot does NOT retain the backing allocation's lifetime.
+    VkDeviceMemory backing_memory;
+    VkDeviceSize backing_offset, backing_size;
+    uint32_t backing_memory_type;
     VPage *pt;                         // POOL_VIRT: size / 64 KiB entries
+    uint64_t *pt_generation;           // POOL_VIRT: the generation of each page's latest MapVirtual or unmap
+    uint64_t vmax_gen;                 // POOL_VIRT: the newest of them (vk_mem_vpages_changed skips unchanged pools)
     uint64_t npages;
     volatile int32_t used;                // resolved at least once: the GPU may still read it at finalize
+    volatile uint8_t lazy;                // imported pool deferred until its first GPU use (lazy_import)
     // TOTK_TRACE=perf dirty census (vk_mem_dirty_submit), replay thread under the submit lock only:
     uint32_t bound_sub;                // last submit that bound it as a buffer (dirty_sub), 0 never
     uint32_t synced_gen;               // page generation its lazy-mirror count covers; DIRTY_UNSYNCED until scanned
@@ -80,6 +88,14 @@ static PlatMutex pool_lock = PLAT_MUTEX_INIT;
 // Bumped under pool_lock (exclusive) by every change to the index or a page table: vk_mem_resolve's per-thread hits
 // stay valid while it is unchanged.
 static uint64_t pool_gen = 1;
+// M15.23: distinct from pool_gen (which invalidates buffer resolve caches). 64-bit generations let a future
+// sparse-texture residency manager ask for remapped pages without rescanning gigabytes of unchanged virtual space.
+static uint64_t dkb_vpage_generation = 1;
+static uint64_t dkb_next_vpage_generation(void) {
+    ++dkb_vpage_generation;
+    if (!dkb_vpage_generation) ++dkb_vpage_generation;
+    return dkb_vpage_generation;
+}
 static uint64_t storage_serial;
 // Bumped when a buffer use may get another buffer for the same span (a mirror created, refused or forgotten) and at
 // every submission's start (mirror syncs are per submission). vk_mem_gen: both together.
@@ -88,6 +104,8 @@ static pidx pool_index;                // POOL_IMPORT, POOL_PHYS and POOL_VIRT r
 static PoolRec **phys_list;            // physical pools by key, for MapVirtual requests
 static int nphys, cap_phys;
 static int32_t n_imports, n_import_failures;
+static PlatMutex lazy_lock = PLAT_MUTEX_INIT;   // NVIDIA serializes these imports; keep one host call in flight
+static volatile int32_t n_lazy_imports;
 static PFN_vkGetMemoryHostPointerPropertiesEXT p_host_props;
 
 static VkBufferUsageFlags pool_usage(const VkCtx *c) {
@@ -165,6 +183,43 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     return 1;
 }
 
+// Most small imported pools never reach the GPU. Deferring their Vulkan import avoids both the vkAllocateMemory stall
+// and the driver's device-memory accounting for CPU-only pools. Large application pools stay eager: on DKB, deferring
+// a 2.3 GiB pool let ordinary images consume its budget first and made its required first-use import fail. The public
+// DKB implementation supplied the measured lazy-import model; this size guard is DKB's allocation-order requirement.
+// TOTK_POOL_LAZY=0 restores fully eager import. Shadow storage copies the guest pages at creation and remains eager.
+#define LAZY_IMPORT_MAX (256ull << 20)
+static int lazy_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = cfg_get("TOTK_POOL_LAZY");
+        on = !(e && !strcmp(e, "0")) && !shadow_on;
+        if (on) rt_log("DKB-MEMORY-STABILITY: imported pools up to 256 MiB are imported on first GPU use (TOTK_POOL_LAZY=0 disables)");
+    }
+    return on;
+}
+
+// Caller holds pool_lock shared or exclusive, so finalize cannot free r during the import.
+static int lazy_import(PoolRec *r) {
+    if (!__atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE)) return r->buf != VK_NULL_HANDLE;
+    plat_mutex_lock(&lazy_lock);
+    if (r->lazy) {
+        mem_thaw((uintptr_t)r->lo, r->size);
+        if (!import_pool(vk_ctx(), r, r->lo, r->size)) {
+            long n = plat_inc32(&n_import_failures);
+            if (n <= 8)
+                rt_log("vk: pool %#llx (flags %#x, %#llx bytes) has no GPU buffer (%ld so far)",
+                       (unsigned long long)r->lo, r->flags, (unsigned long long)r->size, n);
+            r->buf = VK_NULL_HANDLE;
+        } else {
+            plat_inc32(&n_lazy_imports);
+        }
+        __atomic_store_n(&r->lazy, 0, __ATOMIC_RELEASE);
+    }
+    plat_mutex_unlock(&lazy_lock);
+    return r->buf != VK_NULL_HANDLE;
+}
+
 // Physical pool: device-local memory of the pool size that both buffers and optimal-tiling images can be bound to.
 static int alloc_physical(VkCtx *c, PoolRec *r) {
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = r->size, .usage = pool_usage(c),
@@ -188,15 +243,48 @@ static int alloc_physical(VkCtx *c, PoolRec *r) {
     VkMemoryRequirements req = {.size = (rb.size + align - 1) & ~(align - 1), .alignment = align, .memoryTypeBits = bits};
     VmaAllocationCreateInfo aci = {.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
                                    .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT};
-    if ((res = vmaAllocateMemory(c->vma, &req, &aci, &r->alloc, NULL)) != VK_SUCCESS ||
-        (res = vmaBindBufferMemory(c->vma, r->alloc, r->buf)) != VK_SUCCESS) {
-        rt_log("vk: physical pool of %#llx bytes: device-local allocation failed (%d)", (unsigned long long)r->size, (int)res);
+    res = vmaAllocateMemory(c->vma, &req, &aci, &r->alloc, NULL);
+    // DKB VRAM fallback: a physical NVN pool is still required when VRAM is exhausted. Retry only if Vulkan says
+    // the buffer AND optimal image accept a NON-device-local memory type; do not silently allocate a second
+    // device-local block or change any guest page mappings. A host-memory-backed pool can be slower, but it is
+    // preferable to turning a subsequent MapVirtual into a missing physical pool. No substitute is invented if
+    // the requirements offer no compatible non-local type. The fallback is opt-out for A/B comparison.
+    if (res == VK_ERROR_OUT_OF_DEVICE_MEMORY && cfg_get("DKB_POOL_HOST_FALLBACK") &&
+        strcmp(cfg_get("DKB_POOL_HOST_FALLBACK"), "0") == 0) {
+        // Explicitly disabled: preserve original failure mode.
+    } else if (res == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        uint32_t host_bits = req.memoryTypeBits;
+        for (uint32_t i = 0; i < c->mem_props.memoryTypeCount; i++)
+            if (c->mem_props.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                host_bits &= ~(1u << i);
+        if (host_bits) {
+            VkMemoryRequirements host_req = req;
+            host_req.memoryTypeBits = host_bits;
+            VmaAllocationCreateInfo host_aci = aci;
+            host_aci.requiredFlags = 0;
+            host_aci.preferredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+            res = vmaAllocateMemory(c->vma, &host_req, &host_aci, &r->alloc, NULL);
+            if (res == VK_SUCCESS)
+                rt_log("DKB-VRAM: physical pool %#llx bytes backed by compatible host memory after device-local OOM",
+                       (unsigned long long)r->size);
+        }
+    }
+    if (res == VK_SUCCESS) res = vmaBindBufferMemory(c->vma, r->alloc, r->buf);
+    if (res != VK_SUCCESS) {
+        rt_log("vk: physical pool of %#llx bytes: compatible memory allocation/bind failed (%d)", (unsigned long long)r->size, (int)res);
         if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
         vkDestroyBuffer(c->device, r->buf, NULL);
         r->buf = VK_NULL_HANDLE;
         r->alloc = NULL;
         return 0;
     }
+    // Snapshot VMA metadata once. Do not call VMA APIs from a virtual-page reader holding pool_lock.
+    VmaAllocationInfo physical_info;
+    vmaGetAllocationInfo(c->vma, r->alloc, &physical_info);
+    r->backing_memory = physical_info.deviceMemory;
+    r->backing_offset = physical_info.offset;
+    r->backing_size = physical_info.size;
+    r->backing_memory_type = physical_info.memoryType;
     if (vk_fix_zero()) {   // Switch pool memory starts zeroed; once per pool, not per image placed in it
         VkCommandBuffer cb = vk_upload_begin();
         vkCmdFillBuffer(cb, r->buf, 0, VK_WHOLE_SIZE, 0);
@@ -236,6 +324,7 @@ static void destroy_rec(VkCtx *c, PoolRec *r) {
     if (r->buf) vkDestroyBuffer(c->device, r->buf, NULL);
     if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
     if (r->alloc) vmaFreeMemory(c->vma, r->alloc);
+    free(r->pt_generation);
     free(r->pt);
     free(r);
 }
@@ -264,15 +353,25 @@ int vk_pool_init(pool_t *p) {
     if (p->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) {
         r->kind = POOL_VIRT;
         r->npages = p->size / NVN_VPOOL_PAGE;
+        // Both arrays are allocated together. No recorded source data or packed RomFS is touched.
         r->pt = calloc(r->npages ? r->npages : 1, sizeof *r->pt);
-        ok = r->pt != NULL;
+        r->pt_generation = calloc(r->npages ? r->npages : 1, sizeof *r->pt_generation);
+        ok = r->pt != NULL && r->pt_generation != NULL;
     } else if (p->flags & NVN_MEMORY_POOL_FLAGS_PHYSICAL) {
         r->kind = POOL_PHYS;
         ok = alloc_physical(c, r);
     } else {
         r->kind = POOL_IMPORT;
-        mem_thaw((uintptr_t)p->mem, p->size);   // the import may need write access to the pages
-        ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
+        if (lazy_enabled() && p->size <= LAZY_IMPORT_MAX) {
+            uint64_t al = c->min_imported_host_alignment ? c->min_imported_host_alignment : 0x1000;
+            r->import_lo = r->lo & ~(al - 1);
+            r->import_hi = (r->lo + r->size + al - 1) & ~(al - 1);
+            r->lazy = 1;
+            ok = 1;
+        } else {
+            mem_thaw((uintptr_t)p->mem, p->size);   // the import may need write access to the pages
+            ok = import_pool(c, r, (uintptr_t)p->mem, p->size);
+        }
         if (!ok) {
             // Not fatal for the game: the pool works for the CPU, and vk_mem_resolve reports its addresses as unbacked.
             long n = plat_inc32(&n_import_failures);
@@ -282,7 +381,7 @@ int vk_pool_init(pool_t *p) {
             ok = 1;
         }
     }
-    if (!ok) { free(r->pt); free(r); return 0; }
+    if (!ok) { free(r->pt_generation); free(r->pt); free(r); return 0; }
     plat_mutex_lock(&pool_lock);
     if (!++storage_serial) ++storage_serial;
     r->storage_serial = storage_serial;
@@ -311,11 +410,18 @@ void vk_pool_fini(pool_t *p) {
     if (r && r->kind == POOL_PHYS) {
         for (int i = 0; i < nphys; i++)
             if (phys_list[i] == r) { phys_list[i] = phys_list[--nphys]; break; }
-        for (int i = 0; i < pool_index.n; i++) {   // virtual pages that still map it become unmapped
+        // A physical-pool destruction invalidates all its page-table aliases. Stamp each cleared page so a
+        // future sparse residency sync knows it must unbind the old tile, not keep using freed VkDeviceMemory.
+        uint64_t invalidated = dkb_next_vpage_generation();
+        for (int i = 0; i < pool_index.n; i++) {
             PoolRec *v = pool_index.e[i].buf;
             if (v->kind != POOL_VIRT) continue;
-            for (uint64_t k = 0; k < v->npages; k++)
-                if (v->pt[k].phys == r) v->pt[k].phys = NULL;
+            for (uint64_t k = 0; k < v->npages; k++) {
+                if (v->pt[k].phys != r) continue;
+                v->pt[k] = (VPage){0};
+                v->pt_generation[k] = invalidated;
+                v->vmax_gen = invalidated;
+            }
         }
     }
     plat_mutex_unlock(&pool_lock);
@@ -350,6 +456,7 @@ int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
     PoolRec *r = e && e->key == v ? e->buf : NULL;
     int ok = r && r->kind == POOL_VIRT;
     __atomic_add_fetch(&pool_gen, 1, __ATOMIC_RELEASE);
+    uint64_t updated = dkb_next_vpage_generation();
     for (int i = 0; ok && i < n; i++) {
         PoolRec *ph = rq[i].physical_pool ? phys_find((const pool_t *)(const void *)rq[i].physical_pool) : NULL;
         if (rq[i].physical_pool && !ph) {
@@ -360,12 +467,102 @@ int vk_pool_map_virtual(pool_t *v, int n, const void *requests) {
         }
         uint64_t first = (uint64_t)rq[i].virtual_offset / NVN_VPOOL_PAGE, count = rq[i].size / NVN_VPOOL_PAGE;
         if (first + count > r->npages) { ok = 0; break; }
-        for (uint64_t k = 0; k < count; k++)
+        for (uint64_t k = 0; k < count; k++) {
             r->pt[first + k] = (VPage){ph, ph ? (uint64_t)rq[i].physical_offset + k * NVN_VPOOL_PAGE : 0};
+            r->pt_generation[first + k] = updated;
+        }
+        if (count) r->vmax_gen = updated;
     }
     plat_mutex_unlock(&pool_lock);
     if (!ok) rt_log("vk: MapVirtual on pool %p failed", (void *)v->mem);
     return ok;
+}
+
+// M15.23: read-only 64 KiB virtual-page snapshots for a future sparse texture residency implementation.
+// The caller owns out[count] and supplies a MAXIMUM of 4096 pages per call. Each entry is copied under
+// pool_lock. No Vulkan/VMA operation or GPU submission is allowed while pool_lock is held. A snapshot is
+// NOT a retained allocation: do not pass returned deviceMemory to vkQueueBindSparse without a separate
+// lifetime/pin protocol and fresh mapping-generation check. M15.23 does not issue any sparse bind.
+int vk_dkb_virtual_pages(uint64_t addr, uint32_t count, uint64_t since, VkDkbVirtualPage *out, uint64_t *now) {
+    if (!out || !now || !count || count > 4096 || (addr & (NVN_VPOOL_PAGE - 1)) ||
+        addr > UINT64_MAX - (uint64_t)count * NVN_VPOOL_PAGE) return 0;
+    plat_mutex_lock_shared(&pool_lock);
+    const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, (uint64_t)count * NVN_VPOOL_PAGE);
+    const PoolRec *v = e ? e->buf : NULL;
+    if (!v || v->kind != POOL_VIRT || addr < v->lo ||
+        (addr - v->lo) / NVN_VPOOL_PAGE + count > v->npages) {
+        plat_mutex_unlock_shared(&pool_lock);
+        return 0;
+    }
+    uint64_t first = (addr - v->lo) / NVN_VPOOL_PAGE;
+    for (uint32_t k = 0; k < count; k++) {
+        const VPage *pg = &v->pt[first + k];
+        const PoolRec *ph = pg->phys;
+        VkDkbVirtualPage *d = &out[k];
+        *d = (VkDkbVirtualPage){0};
+        d->gpu_address = addr + (uint64_t)k * NVN_VPOOL_PAGE;
+        d->generation = v->pt_generation[first + k];
+        d->changed = d->generation > since;
+        if (!ph || ph->kind != POOL_PHYS || !ph->backing_memory ||
+            ph->size < NVN_VPOOL_PAGE || pg->off > ph->size - NVN_VPOOL_PAGE) continue;
+        d->mapped = 1;
+        d->device_memory = ph->backing_memory;
+        d->device_offset = ph->backing_offset + pg->off;
+        d->buffer = ph->buf;
+        d->buffer_offset = pg->off;
+        d->memory_type = ph->backing_memory_type;
+        d->physical_flags = ph->flags;
+        d->physical_storage_serial = ph->storage_serial;
+    }
+    *now = dkb_vpage_generation;
+    plat_mutex_unlock_shared(&pool_lock);
+    return 1;
+}
+
+int vk_mem_vpages_changed(uint64_t addr, uint64_t n, uint64_t since, VkMemVPageFn fn, void *ctx, uint64_t *now) {
+    if (!n || (addr & (NVN_VPOOL_PAGE - 1)) || addr > UINT64_MAX - n * NVN_VPOOL_PAGE) return 0;
+    plat_mutex_lock_shared(&pool_lock);
+    const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, n * NVN_VPOOL_PAGE);
+    const PoolRec *v = e ? e->buf : NULL;
+    if (!v || v->kind != POOL_VIRT || addr < v->lo || (addr - v->lo) / NVN_VPOOL_PAGE + n > v->npages) {
+        plat_mutex_unlock_shared(&pool_lock);
+        return 0;
+    }
+    *now = dkb_vpage_generation;
+    if (v->vmax_gen > since) {
+        uint64_t first = (addr - v->lo) / NVN_VPOOL_PAGE;
+        for (uint64_t k = 0; k < n; k++) {
+            if (v->pt_generation[first + k] <= since) continue;
+            const VPage *pg = &v->pt[first + k];
+            const PoolRec *ph = pg->phys;
+            VkMemVPage d = {0};
+            if (ph && ph->kind == POOL_PHYS && ph->size >= NVN_VPOOL_PAGE && pg->off <= ph->size - NVN_VPOOL_PAGE) {
+                d.serial = ph->storage_serial, d.off = pg->off, d.flags = ph->flags;
+                if ((ph->flags & (NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED | NVN_MEMORY_POOL_FLAGS_CPU_CACHED)) &&
+                    !nvn_gpu_only(ph->lo))
+                    d.host = (const uint8_t *)(uintptr_t)(ph->lo + pg->off);
+            }
+            fn(ctx, k, &d);
+        }
+    }
+    plat_mutex_unlock_shared(&pool_lock);
+    return 1;
+}
+
+// Returns only a page census, never a pointer or Vulkan handle. Gives M15.24 a cheap sanity counter.
+void vk_dkb_virtual_page_stats(uint64_t *total, uint64_t *mapped, uint64_t *generation) {
+    uint64_t t = 0, m = 0;
+    plat_mutex_lock_shared(&pool_lock);
+    for (int i = 0; i < pool_index.n; i++) {
+        const PoolRec *v = pool_index.e[i].buf;
+        if (v->kind != POOL_VIRT) continue;
+        t += v->npages;
+        for (uint64_t k = 0; k < v->npages; k++) m += v->pt[k].phys != NULL;
+    }
+    if (generation) *generation = dkb_vpage_generation;
+    plat_mutex_unlock_shared(&pool_lock);
+    if (total) *total = t;
+    if (mapped) *mapped = m;
 }
 
 // Per-thread copies of resolved import and physical pools that overlap no other index entry (so pidx_find picks them for
@@ -521,6 +718,7 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, size);
     PoolRec *r = e ? e->buf : NULL;
     int ok = 0;
+    if (r && r->kind == POOL_IMPORT && __atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE)) lazy_import(r);
     if (r && (r->kind == POOL_IMPORT ? r->buf != VK_NULL_HANDLE : r->kind == POOL_PHYS)) {
         int i = (int)(e - pool_index.e);
         if ((i == 0 || pool_index.maxhi[i - 1] <= e->lo) && (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= e->hi)) {
@@ -610,6 +808,15 @@ static void vram_log(uint64_t frame);
 
 void vk_mem_census(uint64_t frame) {
     static uint64_t window_start;
+    // Race-start failures can occur before the first full census (frame 600). Log one early page-map snapshot
+    // without scanning a multi-gigabyte texture or exposing guest/game data.
+    if ((rt_trace & RT_TRACE_PERF) && (frame == 60 || frame == 240)) {
+        uint64_t vt = 0, vm = 0, vg = 0;
+        vk_dkb_virtual_page_stats(&vt, &vm, &vg);
+        rt_log("DKB-VPAGE: at frame %llu mapped %llu/%llu virtual 64KiB pages (%.1f/%.1f MiB), gen %llu; no sparse images bound",
+               (unsigned long long)frame, (unsigned long long)vm, (unsigned long long)vt,
+               vm / 16.0, vt / 16.0, (unsigned long long)vg);
+    }
     if ((rt_trace & RT_TRACE_PERF) && frame % 600 == 0) vram_log(frame);
     if ((rt_trace & RT_TRACE_PERF) && !vk_mirror_on) dirty_frame(frame);
     if ((rt_trace & RT_TRACE_PERF) ? frame % 60 == 0 : frame == 600 || frame == 1800)
@@ -641,6 +848,13 @@ void vk_mem_census(uint64_t frame) {
            (unsigned long long)frame, (unsigned long long)count[POOL_IMPORT], total[POOL_IMPORT] / 1048576.0,
            n_import_failures, (unsigned long long)count[POOL_PHYS], total[POOL_PHYS] / 1048576.0,
            (unsigned long long)count[POOL_VIRT], total[POOL_VIRT] / 1048576.0);
+    // M15.23: mapped virtual pages are not necessarily resident VkImage tiles. A census is not proof of
+    // texture data, sparse image residency, or a presented pixel.
+    uint64_t vt = 0, vm = 0, vg = 0;
+    vk_dkb_virtual_page_stats(&vt, &vm, &vg);
+    rt_log("DKB-VPAGE: at frame %llu mapped %llu/%llu virtual 64KiB pages (%.1f/%.1f MiB), gen %llu; no sparse images bound",
+           (unsigned long long)frame, (unsigned long long)vm, (unsigned long long)vt,
+           vm / 16.0, vt / 16.0, (unsigned long long)vg);
     static const char *const kinds[] = {"", "import", "physical", "virtual"};
     for (int j = 0; j < ng; j++) {
         char f[160];
@@ -669,17 +883,30 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
         VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
         VkPhysicalDeviceMemoryProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, .pNext = &b};
         vkGetPhysicalDeviceMemoryProperties2(c->phys, &p2);
-        for (uint32_t h = 0; h < p2.memoryProperties.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
-            if (p2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                *used += b.heapUsage[h], *budget += b.heapBudget[h];
+        // A discrete GPU may expose the same VRAM through multiple device-local heaps (e.g. BAR-visible VRAM).
+        // Summing their budgets is not a usable capacity for textures. Follow the primary (largest) local heap,
+        // rather than pretending a secondary heap adds independent VRAM. This is budget reporting/eviction only.
+        uint64_t biggest = 0;
+        for (uint32_t h = 0; h < p2.memoryProperties.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++) {
+            if (!(p2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+            if (b.heapBudget[h] > biggest) {
+                biggest = b.heapBudget[h];
+                *used = b.heapUsage[h];
+                *budget = b.heapBudget[h];
+            }
+        }
         *exact = 1;
         return *budget != 0;
     }
     VmaBudget vb[VK_MAX_MEMORY_HEAPS];
     vmaGetHeapBudgets(c->vma, vb);
-    for (uint32_t h = 0; h < mp->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++)
-        if (mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-            *used += vb[h].statistics.blockBytes, *budget += mp->memoryHeaps[h].size;
+    for (uint32_t h = 0; h < mp->memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; h++) {
+        if (!(mp->memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) continue;
+        if (mp->memoryHeaps[h].size > *budget) {
+            *used = vb[h].statistics.blockBytes;
+            *budget = mp->memoryHeaps[h].size;
+        }
+    }
     return *budget != 0;
 }
 
@@ -1287,6 +1514,7 @@ static void dirty_frame(uint64_t frame) {
 #define VERIFY_BYTES (4u << 20)
 #define VERIFY_SAMPLES 64
 #define VERIFY_LOG 16
+#define MIRROR_MAX_BYTES (256ull << 20)
 enum { MR_BUDGET, MR_UNTRACKED, MR_OVERLAP, MR_ALLOC, MR_N };
 
 int vk_mirror_on;
@@ -1426,6 +1654,14 @@ static void mirror_create(PoolRec *r) {
     plat_mutex_unlock_shared(&pool_lock);
     if (i < 0) return;   // finalized meanwhile
     if (!alone) return refuse(r, MR_OVERLAP, "it overlaps another pool");
+    // Mirroring a multi-gigabyte application pool defeats the range cache: DKB rewrites hundreds of MiB of it each
+    // frame at course load, so the full mirror both consumes the 8 GiB card and adds two PCIe copies. The imported
+    // buffer is already the correct backing; mirrors are reserved for the smaller hot vertex/index/storage pools.
+    if (n > MIRROR_MAX_BYTES) {
+        char why[112];
+        snprintf(why, sizeof why, "its %.1f MiB range exceeds the 256 MiB mirror limit", n / 1048576.0);
+        return refuse(r, MR_BUDGET, why);
+    }
     uint64_t r0 = r->import_lo >> SNAP_SHIFT, r1 = (r->import_hi - 1) >> SNAP_SHIFT;
     if (r1 >= SNAP_REGIONS) return refuse(r, MR_UNTRACKED, "outside the write-watched address space");
     uint64_t used, budget;
@@ -1934,7 +2170,7 @@ void vk_upload_perf(uint64_t *gpu_ns, uint64_t *timed, uint64_t *batches, uint64
     *bytes = (uint64_t)plat_xchg64(&up_bytes, 0);
 }
 
-enum { DEAD_IMAGE = 1, DEAD_IMAGE_VMA, DEAD_VIEW, DEAD_BUFFER_VMA };
+enum { DEAD_IMAGE = 1, DEAD_IMAGE_VMA, DEAD_VIEW, DEAD_BUFFER_VMA, DEAD_MEMORY_VMA };
 typedef struct { int kind; uint64_t handle; VmaAllocation alloc; uint64_t seq, tl; } Dead;
 
 static PlatRMutex cmd_lock;
@@ -2003,6 +2239,7 @@ static void collect_locked(VkCtx *c) {
         case DEAD_IMAGE_VMA: vmaDestroyImage(c->vma, (VkImage)(uintptr_t)d->handle, d->alloc); break;
         case DEAD_VIEW: vkDestroyImageView(c->device, (VkImageView)(uintptr_t)d->handle, NULL); break;
         case DEAD_BUFFER_VMA: vmaDestroyBuffer(c->vma, (VkBuffer)(uintptr_t)d->handle, d->alloc); break;
+        case DEAD_MEMORY_VMA: vmaFreeMemory(c->vma, d->alloc); break;
         }
     }
     ndead = k;
@@ -2100,20 +2337,126 @@ void *vk_staging(VkDeviceSize size, VkBuffer *buf, VmaAllocation *alloc) {
     return info.pMappedData;
 }
 
+// M15.26 sparse residency (dkb_sparse_tex.c): image binds queued while upload batches are recorded. vk_upload_flush
+// submits them with vkQueueBindSparse right before the open batch, which waits for them: its uploads into newly bound
+// blocks land in their memory, and its barriers order the frame after both.
+typedef struct { VkImage image; uint8_t opaque; union { VkSparseImageMemoryBind ib; VkSparseMemoryBind ob; } u; } SparseBind;
+static SparseBind *sp_q;
+static int nsp_q, cap_sp_q;
+static VkSemaphore sp_sem;
+static uint64_t sp_val;
+static volatile int64_t n_sp_binds, n_sp_submits;
+
+static void sparse_queue(VkImage image, int opaque, const void *b, int n) {
+    plat_once(&cmd_once, cmd_init, NULL);
+    plat_rmutex_lock(&cmd_lock);
+    for (int i = 0; i < n; i++) {
+        if (nsp_q == cap_sp_q) grow((void **)&sp_q, &cap_sp_q, sizeof *sp_q);
+        SparseBind *q = &sp_q[nsp_q++];
+        q->image = image, q->opaque = (uint8_t)opaque;
+        if (opaque) q->u.ob = ((const VkSparseMemoryBind *)b)[i];
+        else q->u.ib = ((const VkSparseImageMemoryBind *)b)[i];
+    }
+    plat_rmutex_unlock(&cmd_lock);
+}
+void vk_sparse_bind(VkImage image, const VkSparseImageMemoryBind *b, int n) { sparse_queue(image, 0, b, n); }
+void vk_sparse_bind_opaque(VkImage image, const VkSparseMemoryBind *b, int n) { sparse_queue(image, 1, b, n); }
+void vk_sparse_stats(uint64_t *binds, uint64_t *submits) {
+    *binds = (uint64_t)plat_xchg64(&n_sp_binds, 0);
+    *submits = (uint64_t)plat_xchg64(&n_sp_submits, 0);
+}
+
+// The end of a batch that waits for binds: a command the wait covers, then a full barrier. The barrier's first scope
+// must hold a command of the batch for the wait to chain through it to the frames submitted after the batch.
+static VkBuffer sp_dummy;
+static VmaAllocation sp_dummy_alloc;
+static void sparse_order(VkCtx *c, VkCommandBuffer cb) {
+    if (!sp_dummy) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 256,
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateBuffer(c->vma, &bi, &ai, &sp_dummy, &sp_dummy_alloc, NULL) != VK_SUCCESS)
+            rt_fatal("vk: sparse bind order buffer");
+    }
+    vkCmdFillBuffer(cb, sp_dummy, 0, 4, 0);
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+}
+
+// cmd_lock and the queue lock held: submits the queued binds, signalling sp_val. 1 when there were any.
+static int sparse_submit(VkCtx *c) {
+    if (!nsp_q) return 0;
+    if (!sp_sem) {
+        VkSemaphoreTypeCreateInfo ti = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+        VkSemaphoreCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &ti};
+        if (vkCreateSemaphore(c->device, &si, NULL, &sp_sem) != VK_SUCCESS) rt_fatal("vk: sparse bind semaphore");
+    }
+    VkSparseImageMemoryBindInfo *ii = malloc(sizeof *ii * (size_t)nsp_q);
+    VkSparseImageOpaqueMemoryBindInfo *oi = malloc(sizeof *oi * (size_t)nsp_q);
+    VkSparseImageMemoryBind *ib = malloc(sizeof *ib * (size_t)nsp_q);
+    VkSparseMemoryBind *ob = malloc(sizeof *ob * (size_t)nsp_q);
+    if (!ii || !oi || !ib || !ob) rt_fatal("vk: out of memory (sparse binds)");
+    uint32_t nii = 0, noi = 0, nib = 0, nob = 0;
+    for (int i = 0; i < nsp_q; i++) {   // runs of one image and kind, in queue order
+        const SparseBind *q = &sp_q[i];
+        if (q->opaque) {
+            if (!noi || oi[noi - 1].image != q->image || i == 0 || !sp_q[i - 1].opaque)
+                oi[noi++] = (VkSparseImageOpaqueMemoryBindInfo){q->image, 0, ob + nob};
+            ob[nob++] = q->u.ob, oi[noi - 1].bindCount++;
+        } else {
+            if (!nii || ii[nii - 1].image != q->image || i == 0 || sp_q[i - 1].opaque)
+                ii[nii++] = (VkSparseImageMemoryBindInfo){q->image, 0, ib + nib};
+            ib[nib++] = q->u.ib, ii[nii - 1].bindCount++;
+        }
+    }
+    uint64_t v = sp_val + 1;
+    VkTimelineSemaphoreSubmitInfo ts = {.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+                                        .signalSemaphoreValueCount = 1, .pSignalSemaphoreValues = &v};
+    VkBindSparseInfo bi = {.sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, .pNext = &ts, .imageOpaqueBindCount = noi,
+                           .pImageOpaqueBinds = oi, .imageBindCount = nii, .pImageBinds = ii,
+                           .signalSemaphoreCount = 1, .pSignalSemaphores = &sp_sem};
+    VkResult r = vkQueueBindSparse(c->gfx_queue, 1, &bi, VK_NULL_HANDLE);
+    if (r != VK_SUCCESS) {
+        vk_device_fault_report(r);
+        rt_fatal("vk: sparse bind of %d blocks failed (%d)", nsp_q, (int)r);
+    }
+    sp_val = v;
+    plat_add64(&n_sp_binds, nsp_q);
+    plat_inc64(&n_sp_submits);
+    nsp_q = 0;
+    free(ii), free(oi), free(ib), free(ob);
+    return 1;
+}
+
 uint64_t vk_upload_flush(int wait) {
     plat_once(&cmd_once, cmd_init, NULL);
     plat_rmutex_lock(&cmd_lock);
     VkCtx *c = vk_ctx();
+    if (c && nsp_q && !open_active) {   // a batch to carry the wait
+        vk_upload_begin();
+        vk_upload_end();
+    }
     uint64_t seq = next_seq;
     if (c && open_active) {
         for (int i = 0; i < open_b.nstg; i++) vmaFlushAllocation(c->vma, open_b.stg[i].alloc, 0, VK_WHOLE_SIZE);
         vk_crumb(open_b.cb, VK_CRUMB_UPLOAD_END, open_b.seq);
+        if (nsp_q) sparse_order(c, open_b.cb);
         if (open_b.timed)
             vkCmdWriteTimestamp(open_b.cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, up_pool, 2 * (uint32_t)open_b.ts + 1);
         vkEndCommandBuffer(open_b.cb);
         plat_inc64(&up_batches);
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &open_b.cb};
+        VkPipelineStageFlags sp_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        VkTimelineSemaphoreSubmitInfo sp_ts = {.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+                                               .waitSemaphoreValueCount = 1, .pWaitSemaphoreValues = &sp_val};
         vk_queue_lock();
+        if (sparse_submit(c))
+            si.pNext = &sp_ts, si.waitSemaphoreCount = 1, si.pWaitSemaphores = &sp_sem, si.pWaitDstStageMask = &sp_stage;
         VkResult r = vkQueueSubmit(c->gfx_queue, 1, &si, open_b.fence);
         vk_queue_unlock();
         if (r != VK_SUCCESS) {
@@ -2167,6 +2510,7 @@ void vk_defer_view(VkImageView view) { if (view) defer(DEAD_VIEW, (uint64_t)(uin
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc) {
     if (buf) defer(DEAD_BUFFER_VMA, (uint64_t)(uintptr_t)buf, alloc);
 }
+void vk_defer_memory(VmaAllocation alloc) { if (alloc) defer(DEAD_MEMORY_VMA, 0, alloc); }
 
 void vk_mem_protect_until(uint64_t timeline_value) {
     plat_once(&cmd_once, cmd_init, NULL);
@@ -2224,6 +2568,9 @@ void vk_mem_shutdown(void) {
     if (stg_pool) vmaDestroyPool(c->vma, stg_pool);   // after retire: no staging buffer is left in it
     stg_pool = NULL;
     stg_pool_tried = 0;
+    if (sp_sem) vkDestroySemaphore(c->device, sp_sem, NULL);
+    if (sp_dummy) vmaDestroyBuffer(c->vma, sp_dummy, sp_dummy_alloc);
+    sp_sem = VK_NULL_HANDLE, sp_val = 0, nsp_q = 0, sp_dummy = VK_NULL_HANDLE;
     plat_rmutex_unlock(&cmd_lock);
     plat_mutex_lock(&pool_lock);
     for (int i = 0; i < pool_index.n; i++) destroy_rec(c, pool_index.e[i].buf);

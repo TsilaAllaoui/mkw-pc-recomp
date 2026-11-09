@@ -703,6 +703,10 @@ class Lifter:
                     return Insn('op', self.sc.crc(w))
                 gprs = [(p, r) for p, r in ((0, rd), (5, rn), (16, rm)) if r != 31]
                 return Insn('asm', asm=AsmInsn(w, set(), gprs))
+            if sf and opcode == 12:
+                # PACGA: the host holds no keys, so the code is 0 (as in Eglantine's dynarmic). sdk's _setjmp and
+                # longjmp both hash the saved registers with it, and compare equal codes.
+                return Insn('op', set_reg(1, rd, '0ull'))
             a, b = R(sf, rn), R(sf, rm)
             expr = {
                 2: f'udiv{size}({a}, {b})',

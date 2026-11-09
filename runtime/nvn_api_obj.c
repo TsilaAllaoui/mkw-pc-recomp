@@ -474,55 +474,165 @@ NVN_API(nvnProgramSetShaders) {
     NVN_BLOCKING();
     ret_x(c, prog_set_shaders(arg_p(c, 0), (int)arg_x(c, 1), arg_p(c, 2)));
 }
-// ---- NVN 2 program builder (Donkey Kong Bananza). The game zeroes a 0x80-byte NVNprogramBuilder on the stack, calls
-// SetDefaults, SetDevice and SetShaders(b, n, NVNshaderData[n]) and then nvnProgramInitializeFromBuilder(program, b)
-// (main+0x88be28 sub_710088BDCC; programs 0xa0 apart). The builder keeps its own copy of the stage list, so the
-// initialize step is NVN 1's Initialize + SetShaders.
-#define NVN_PROG_BUILDER_MAGIC 0x50424e32u   // "2NBP"
-typedef struct { uint32_t magic, nstage; void *dev; NVNshaderData sd[6]; } prog_builder_t;
-_Static_assert(sizeof(prog_builder_t) <= 0x80, "NVNprogramBuilder is 0x80 bytes in Bananza");
-static prog_builder_t *prog_builder(Cpu *c, const char *fn) {
-    prog_builder_t *b = arg_p(c, 0);
-    if (!b) rt_fatal("nvn: %s: null program builder", fn);
+/* DKB M13, source replacement for DKB runtime/nvn_api_obj.c ProgramBuilder section.
+ *
+ * Based on KartNative's documented DKB NVN2 0x80-byte ABI.
+ * Uses the existing DKB prog_set_shaders()/NVN2-to-SPIR-V Vulkan path.
+ * Installed only when explicitly requested for the exact audited DKB 1.8.0
+ * ExeFS. Do not use this with Donkey Kong Bananza's inline-builder ABI.
+ *
+ * Public reference: https://github.com/pahorema/kartnative/blob/main/docs/reference/nvn2.md
+ * KartNative (MIT) clean-room ABI research, DKB source (GPL-3.0-or-later).
+ * No proprietary game code or binaries included here.
+ */
+#define DKB_NV2_PROGRAM_ABI_M13 1
+
+typedef struct {
+    uint8_t _reserved00[8];
+    NVNdevice *dev;                  /* +0x08 */
+    uint8_t _reserved10[8];
+    int32_t sample_shading;          /* +0x18 */
+    int32_t debug_hash_count;        /* +0x1c */
+    const void *debug_hashes;        /* +0x20 */
+    int32_t nstage;                  /* +0x28 */
+    uint32_t _pad2c;
+    const NVNshaderData *shaders;    /* +0x30: guest array, NOT inline */
+    int32_t ray_count;               /* +0x38 */
+    uint32_t _pad3c;
+    const NVNshaderData *rays;       /* +0x40 */
+    int32_t linkage_count;           /* +0x48 */
+    uint32_t _pad4c;
+    const void *linkage;             /* +0x50 */
+    int32_t trace_depth;             /* +0x58 */
+    int32_t callable_depth;          /* +0x5c */
+    uint32_t ray_flags;              /* +0x60 */
+    uint8_t _reserved64[0x1c];
+} dkb_program_builder;
+_Static_assert(sizeof(dkb_program_builder) == 0x80, "DKB NVN2 program builder must be 0x80 bytes");
+_Static_assert(offsetof(dkb_program_builder, dev) == 0x08 &&
+               offsetof(dkb_program_builder, nstage) == 0x28 &&
+               offsetof(dkb_program_builder, shaders) == 0x30 &&
+               offsetof(dkb_program_builder, ray_flags) == 0x60,
+               "DKB NVN2 program builder ABI mismatch");
+
+static dkb_program_builder *dkb_prog_builder(Cpu *c, const char *name) {
+    dkb_program_builder *b = arg_p(c, 0);
+    if (!b) rt_fatal("DKB-NVN-PROGRAM-BUILDER: %s: NULL builder", name);
     return b;
 }
-// void nvnProgramBuilderSetDefaults(NVNprogramBuilder *b)
+
 NVN_API(nvnProgramBuilderSetDefaults) {
-    prog_builder_t *b = prog_builder(c, "ProgramBuilderSetDefaults");
-    void *dev = b->magic == NVN_PROG_BUILDER_MAGIC ? b->dev : NULL;   // like the other builders, keep the device
-    memset(b, 0, sizeof *b);
-    b->magic = NVN_PROG_BUILDER_MAGIC;
-    b->dev = dev;
+    dkb_program_builder *b = dkb_prog_builder(c, "SetDefaults");
+    /* The original NVN2 driver leaves device at +0x08 untouched. */
+    memset((uint8_t *)b + 0x18, 0, 0x64 - 0x18);
+    b->trace_depth = 2;
+    b->callable_depth = 2;
 }
-// void nvnProgramBuilderSetDevice(NVNprogramBuilder *b, NVNdevice *d), NVNdevice *...GetDevice(const ... *b)
-NVN_API(nvnProgramBuilderSetDevice) { prog_builder(c, "ProgramBuilderSetDevice")->dev = arg_p(c, 1); }
-NVN_API(nvnProgramBuilderGetDevice) { ret_x(c, (uint64_t)(uintptr_t)prog_builder(c, "ProgramBuilderGetDevice")->dev); }
-// void nvnProgramBuilderSetShaders(NVNprogramBuilder *b, int n, const NVNshaderData *sd)
+NVN_API(nvnProgramBuilderSetDevice) {
+    dkb_prog_builder(c, "SetDevice")->dev = arg_p(c, 1);
+}
+NVN_API(nvnProgramBuilderGetDevice) {
+    ret_x(c, (uint64_t)(uintptr_t)dkb_prog_builder(c, "GetDevice")->dev);
+}
 NVN_API(nvnProgramBuilderSetShaders) {
-    prog_builder_t *b = prog_builder(c, "ProgramBuilderSetShaders");
+    dkb_program_builder *b = dkb_prog_builder(c, "SetShaders");
     int n = (int)arg_x(c, 1);
     const NVNshaderData *sd = arg_p(c, 2);
-    if (n < 0 || n > 6 || (n && !sd)) rt_fatal("nvn: ProgramBuilderSetShaders with %d stages at %p", n, (const void *)sd);
-    b->nstage = (uint32_t)n;
-    if (n) memcpy(b->sd, sd, (size_t)n * sizeof *sd);
+    if (n < 0 || n > 8 || (n && !sd)) {
+        rt_fatal("DKB-NVN-PROGRAM-BUILDER: SetShaders count=%d ptr=%p invalid", n, (const void *)sd);
+    }
+    b->nstage = n;
+    b->shaders = sd;
+    NVN_LOG("DKB NVN2 ProgramBuilderSetShaders count=%d shader_ptr=%p", n, (const void *)sd);
 }
-// int nvnProgramBuilderGetShaderCount(const NVNprogramBuilder *b)
-NVN_API(nvnProgramBuilderGetShaderCount) { ret_x(c, prog_builder(c, "ProgramBuilderGetShaderCount")->nstage); }
-// Per-sample shading, debug data hashes, subroutine linkage and ray-tracing modules: the Vulkan path has no use for
-// them yet; each is logged so a game that depends on one shows up in a gfx trace.
-NVN_API(nvnProgramBuilderSetSampleShading) { NVN_LOG("ProgramBuilderSetSampleShading %d", (int)arg_x(c, 1)); }
-NVN_API(nvnProgramBuilderSetDebugDataHashes) { (void)c; }
-NVN_API(nvnProgramBuilderSetSubroutineLinkage) { NVN_LOG("ProgramBuilderSetSubroutineLinkage %p", arg_p(c, 1)); }
-NVN_API(nvnProgramBuilderSetRayTracingModules) { NVN_LOG("ProgramBuilderSetRayTracingModules %p", arg_p(c, 1)); }
-// NVNboolean nvnProgramInitializeFromBuilder(NVNprogram *p, const NVNprogramBuilder *b)
+NVN_API(nvnProgramBuilderGetShaderCount) {
+    ret_x(c, (uint64_t)(uint32_t)dkb_prog_builder(c, "GetShaderCount")->nstage);
+}
+NVN_API(nvnProgramBuilderGetShaders) {
+    ret_x(c, (uint64_t)(uintptr_t)dkb_prog_builder(c, "GetShaders")->shaders);
+}
+NVN_API(nvnProgramBuilderSetSampleShading) {
+    dkb_prog_builder(c, "SetSampleShading")->sample_shading = (int32_t)arg_x(c, 1);
+}
+NVN_API(nvnProgramBuilderGetSampleShading) {
+    ret_x(c, (uint64_t)(uint32_t)dkb_prog_builder(c, "GetSampleShading")->sample_shading);
+}
+NVN_API(nvnProgramBuilderSetDebugDataHashes) {
+    dkb_program_builder *b = dkb_prog_builder(c, "SetDebugDataHashes");
+    int count = (int)arg_x(c, 1);
+    if (count < 0 || count > 8 || (count && !arg_p(c, 2))) {
+        rt_fatal("DKB-NVN-PROGRAM-BUILDER: bad hash count=%d", count);
+    }
+    b->debug_hash_count = count;
+    b->debug_hashes = arg_p(c, 2);
+}
+NVN_API(nvnProgramBuilderGetDebugDataHashes) {
+    ret_x(c, (uint64_t)(uintptr_t)dkb_prog_builder(c, "GetDebugDataHashes")->debug_hashes);
+}
+NVN_API(nvnProgramBuilderSetSubroutineLinkage) {
+    dkb_program_builder *b = dkb_prog_builder(c, "SetSubroutineLinkage");
+    b->linkage_count = (int32_t)arg_x(c, 1);
+    b->linkage = arg_p(c, 2);
+}
+NVN_API(nvnProgramBuilderGetSubroutineLinkage) {
+    ret_x(c, (uint64_t)(uintptr_t)dkb_prog_builder(c, "GetSubroutineLinkage")->linkage);
+}
+NVN_API(nvnProgramBuilderGetSubroutineLinkageCount) {
+    ret_x(c, (uint64_t)(uint32_t)dkb_prog_builder(c, "GetSubroutineLinkageCount")->linkage_count);
+}
+NVN_API(nvnProgramBuilderSetRayTracingModules) {
+    dkb_program_builder *b = dkb_prog_builder(c, "SetRayTracingModules");
+    b->ray_count = (int32_t)arg_x(c, 1);
+    b->rays = arg_p(c, 2);
+}
+NVN_API(nvnProgramBuilderSetMaxTraceRecursionDepth) {
+    dkb_prog_builder(c, "SetMaxTraceRecursionDepth")->trace_depth = (int32_t)arg_x(c, 1);
+}
+NVN_API(nvnProgramBuilderGetMaxTraceRecursionDepth) {
+    ret_x(c, (uint64_t)(uint32_t)dkb_prog_builder(c, "GetMaxTraceRecursionDepth")->trace_depth);
+}
+NVN_API(nvnProgramBuilderSetMaxCallableRecursionDepth) {
+    dkb_prog_builder(c, "SetMaxCallableRecursionDepth")->callable_depth = (int32_t)arg_x(c, 1);
+}
+NVN_API(nvnProgramBuilderGetMaxCallableRecursionDepth) {
+    ret_x(c, (uint64_t)(uint32_t)dkb_prog_builder(c, "GetMaxCallableRecursionDepth")->callable_depth);
+}
+NVN_API(nvnProgramBuilderSetProgramRayTracingFlags) {
+    dkb_prog_builder(c, "SetProgramRayTracingFlags")->ray_flags = (uint32_t)arg_x(c, 1);
+}
+NVN_API(nvnProgramBuilderGetProgramRayTracingFlags) {
+    ret_x(c, dkb_prog_builder(c, "GetProgramRayTracingFlags")->ray_flags);
+}
 NVN_API(nvnProgramInitializeFromBuilder) {
     NVN_BLOCKING();
     prog_t *o = arg_p(c, 0);
-    const prog_builder_t *b = arg_p(c, 1);
-    if (!o || !b || b->magic != NVN_PROG_BUILDER_MAGIC) rt_fatal("nvn: ProgramInitializeFromBuilder(%p, %p)", (void *)o, (const void *)b);
+    const dkb_program_builder *b = arg_p(c, 1);
+    if (!o || !b || !b->dev) {
+        rt_log("DKB-NVN-PROGRAM-BUILDER: missing program, builder or device; rejecting init");
+        ret_x(c, 0);
+        return;
+    }
+    if (b->ray_count || b->rays || b->ray_flags) {
+        rt_fatal("DKB-NVN-RAY-UNSUPPORTED: ray tracing module requires a real Vulkan implementation");
+    }
+    if (b->linkage_count || b->linkage) {
+        rt_fatal("DKB-NVN-LINKAGE-UNSUPPORTED: shader subroutine linkage cannot be ignored");
+    }
+    if (b->sample_shading) {
+        rt_log("DKB-NVN-SAMPLE-SHADING: mode=%d not implemented by host; stopping to avoid wrong output", b->sample_shading);
+        ret_x(c, 0);
+        return;
+    }
+    if (b->nstage < 0 || b->nstage > 6 || (b->nstage && !b->shaders)) {
+        rt_log("DKB-NVN-SHADER-STAGE-UNSUPPORTED: shader count=%d exceeds current DKB host capacity (6), or NULL data", b->nstage);
+        ret_x(c, 0);
+        return;
+    }
     memset(o, 0, sizeof *o);
     o->magic = NVN_PROG_MAGIC;
-    ret_x(c, prog_set_shaders(o, (int)b->nstage, b->sd));
+    int ok = prog_set_shaders(o, b->nstage, b->shaders);
+    rt_log("DKB-NVN-PROGRAM-BUILDER: InitializeFromBuilder n=%d ok=%d (shader translation may be deferred)", b->nstage, ok);
+    ret_x(c, ok);
 }
 
 // NVNboolean nvnProgramSetShadersExt(NVNprogram *p, int n, const NVNshaderDataExt *sd): no prototype in nvn.h; the

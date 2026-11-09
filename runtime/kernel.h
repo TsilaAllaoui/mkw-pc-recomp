@@ -27,6 +27,8 @@ uint64_t kern_threads_created(void);
 
 // The guest frame-pointer chain from c->x[29] to stderr.
 void kern_backtrace(const Cpu *c);
+// DKB_RECOMP_M2_NPDM_V1: main-thread parameters from Switch 2 main.npdm.
+void kern_configure_main_npdm(uint64_t stack_size, int priority, int core);
 
 // ---- probe support
 enum { KERN_WAIT_NONE, KERN_WAIT_LOCK, KERN_WAIT_CONDVAR, KERN_WAIT_ADDRESS, KERN_WAIT_SYNC };

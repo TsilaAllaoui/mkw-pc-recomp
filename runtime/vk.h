@@ -176,6 +176,32 @@ typedef struct {
     void *pool;   // the imported pool record behind the span (NULL for device memory), for VK_MEM_BOUND
 } VkMemSpan;
 
+// M15.23 page-table snapshots. One entry describes one guest 64KiB virtual page. The Vulkan memory
+// handles are borrowed descriptions and DO NOT retain their lifetime. Snapshot only: never bind sparse
+// images or use the handles after the pool can be destroyed without a separate allocation pin/sync.
+#define DKB_VPAGE_SIZE 65536u
+typedef struct {
+    uint64_t gpu_address, generation, physical_storage_serial;
+    VkDeviceMemory device_memory;
+    VkDeviceSize device_offset;
+    VkBuffer buffer;
+    VkDeviceSize buffer_offset;
+    uint32_t memory_type, physical_flags;
+    uint8_t mapped, changed;
+} VkDkbVirtualPage;
+// Aligned start and count<=4096. Returns 0 when no complete live virtual pool covers the range.
+// The out array is written only on success; since=0 gives the initial mapping snapshot.
+int vk_dkb_virtual_pages(uint64_t addr, uint32_t count, uint64_t since, VkDkbVirtualPage *out, uint64_t *now);
+void vk_dkb_virtual_page_stats(uint64_t *total, uint64_t *mapped, uint64_t *generation);
+// M15.26 sparse residency (dkb_sparse_tex.c): fn(ctx, k, page) for each 64 KiB page k of [addr, addr + n * 64 KiB)
+// whose mapping changed after generation since (0: every page ever mapped or unmapped), under the shared pool lock, so
+// fn must neither call Vulkan nor take a lock. A mapped page names its physical pool by storage serial (0: unmapped)
+// and byte offset; host is the page's CPU storage when that pool is CPU-visible game storage, else NULL. *now: the
+// generation to pass next time. 0 when the range is not inside one live virtual pool.
+typedef struct { uint64_t serial, off; uint32_t flags; const uint8_t *host; } VkMemVPage;
+typedef void (*VkMemVPageFn)(void *ctx, uint64_t k, const VkMemVPage *page);
+int vk_mem_vpages_changed(uint64_t addr, uint64_t n, uint64_t since, VkMemVPageFn fn, void *ctx, uint64_t *now);
+
 // Passive snapshot only, called on the serialized replay thread (mirror state belongs to that thread). Lookup holds
 // the shared pool lock but does not resolve/use/pick a span, create/sync mirrors, touch shadows or mark pools used.
 // Selects the normal one-byte lookup candidate, then requires the whole request to fit that pool/contiguous backing.
@@ -253,7 +279,7 @@ void vk_mem_class_log(const VkPhysicalDeviceProperties *p, const VkPhysicalDevic
 int vk_mem_class_of(uint64_t addr);               // VK_MCLS_* of the pool at addr (NONE when unbacked)
 void vk_mem_census(uint64_t frame);               // at each present: pool census and traffic, logged at frame 1800 and,
                                                   // with TOTK_TRACE=perf, every 1800 frames
-// VRAM in use and its budget, summed over the DEVICE_LOCAL heaps. exact 1: VK_EXT_memory_budget (the whole process),
+// VRAM in use and its budget, using the primary DEVICE_LOCAL heap (not summing aliased heap budgets). exact 1: VK_EXT_memory_budget (the whole process),
 // 0: this allocator's own allocations against the heap sizes. 0 when unknown.
 int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);
 // VRAM headroom (vk_headroom.c): the VMA callbacks that see new device memory, and the thread that allocates the next
@@ -296,6 +322,12 @@ void vk_defer_image(VkImage img, VmaAllocation alloc);   // alloc NULL: vkDestro
 void vk_defer_view(VkImageView view);
 void vk_exec_image_gone(VkImage image);   // destroy_tex, texture lock held: the replay's views of image go with it
 void vk_defer_buffer(VkBuffer buf, VmaAllocation alloc);
+void vk_defer_memory(VmaAllocation alloc);   // vmaFreeMemory
+// Sparse image binds (M15.26), submitted by the next vk_upload_flush right before its batch, which waits for them.
+// Queue them between the vk_upload_begin / vk_upload_end that record the uploads into the newly bound blocks.
+void vk_sparse_bind(VkImage image, const VkSparseImageMemoryBind *b, int n);
+void vk_sparse_bind_opaque(VkImage image, const VkSparseMemoryBind *b, int n);
+void vk_sparse_stats(uint64_t *binds, uint64_t *submits);   // since the last call
 // ---- ASTC (vk_astc.c). TOTK_ASTC = auto | gpu | native | cpu | check; see vk_astc.c.
 enum { VK_ASTC_CPU, VK_ASTC_GPU, VK_ASTC_NATIVE, VK_ASTC_CHECK };
 int vk_astc_mode(void);                 // decided once per device (logged); VK_ASTC_CPU before vk_init

@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "audren.h"
+#include "dkb_hid_jcms.h"   // DKB_HID_JCMS_M14_2
 #include "host.h"
 #include "ipc.h"
 #include "platform/platform.h"
@@ -26,6 +27,7 @@ enum { T_CLOSE = 2, T_REQUEST = 4, T_CONTROL = 5, T_REQUEST_CTX = 6, T_CONTROL_C
 static const struct { const char *name; IpcHandler handler; } services[] = {
     {"audren:u", audren_manager_handler},
     {"aud:u", aud_user_handler},   // Switch 2: the way the SDK reaches audren:u
+    {"hid", hid_server_handler},       // DKB_HID_JCMS_M14_2: Switch 2 JCMS startup
 };
 
 static volatile int32_t g_live;

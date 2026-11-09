@@ -15,6 +15,16 @@ __pycache__/
 /game/
 /build/
 /generated/
+# Never publish extracted console files, packed filesystem images, keys, tickets or dumps even when a local tool puts
+# them outside the conventional game/build directories.
+**/[Ee]xe[Ff][Ss]/
+**/[Rr]om[Ff][Ss]/
+**/romfs.bin
+**/romfs.img
+**/main.npdm
+**/subsdk*
+**/prod.keys
+**/title.keys
 *.xci
 *.xcz
 *.nsp
@@ -24,7 +34,14 @@ __pycache__/
 *.tik
 *.keys
 *.nso
+*.nro
 *.npdm
+*.cert
+*.key
+*.kip
+*.kip1
+*.dmp
+*.core
 *.zs
 *.pack
 *.sarc

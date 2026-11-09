@@ -86,9 +86,35 @@ static void samples_xy(int s, uint32_t *sx, uint32_t *sy) {
     if (s == 2) *sx = 2; else if (s == 4) *sx = *sy = 2; else if (s == 8) { *sx = 4; *sy = 2; }
 }
 
+// Sparse textures (flag 0x20) are mapped in 64 KiB tiles whose shape in blocks follows the bytes per block: 256x256,
+// 256x128, 128x128, 128x64 and 64x64 for 1, 2, 4, 8 and 16 bytes, i.e. 32, 16, 16, 8 and 8 GOBs high (KartNative
+// docs/reference/rendering.md, "Sparse textures laid out in 64 KB tiles" and the three entries after it). A level at
+// least one tile wide and high is whole tiles: its width is padded to whole tiles. When level 0 is such a level, the
+// texture takes the tile's block height unless a packaged layout gives one, and each layer starts on a whole tile
+// (64 KiB), so every tile of a tiled level is one 64 KiB page: (row x tiles per row + column) x 64 KiB into the level.
+// The levels from the first smaller one form the mip tail, packed as usual. The storage ends at the last layer's mip
+// tail, unpadded: DKB puts packaged sparse textures in CPU pools at 4 KiB alignment with nothing mapped past it.
+int nvn_tex_sparse_tile(const nvn_texdesc *d, uint32_t *tw, uint32_t *th, unsigned *gob_h) {
+    if (!(d->flags & 0x20) || nvn_tex_is_linear(d) || d->samples > 1 || (d->target != 1 && d->target != 4)) return 0;
+    switch (fmt_of(d->format).bpb) {
+    case 1: *tw = 256, *th = 256, *gob_h = 5; return 1;
+    case 2: *tw = 256, *th = 128, *gob_h = 4; return 1;
+    case 4: *tw = 128, *th = 128, *gob_h = 4; return 1;
+    case 8: *tw = 128, *th = 64, *gob_h = 3; return 1;
+    case 16: *tw = 64, *th = 64, *gob_h = 3; return 1;
+    default: return 0;
+    }
+}
+
+static int sparse_tiled(const nvn_texdesc *d, fmt_t t, uint32_t w, uint32_t h, uint32_t *tw, uint32_t *th, unsigned *gob_h) {
+    return nvn_tex_sparse_tile(d, tw, th, gob_h) && blk(w, t.bw) >= *tw && blk(h, t.bh) >= *th;
+}
+
 static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl, uint32_t w, uint32_t h, uint32_t z,
                              unsigned tileH, unsigned tileD, fmt_t t) {
     uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
+    uint32_t stw = 0, sth = 0; unsigned sgh = 0;
+    int sparse = sparse_tiled(d, t, w, h, &stw, &sth, &sgh);
     uint64_t off = 0;
     for (unsigned i = 0; i < level; i++) {
         uint32_t lw = blk(mip(w * sx, i), t.bw);
@@ -98,6 +124,11 @@ static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl,
         unsigned th = adj_tile(tileH, 8, lh), td = adj_tile(tileD, 1, ld);
         uint32_t wg = (lwb + 63) / 64, hg = (lh + 7) / 8;
         uint32_t wt = wg, ht = (hg + (1u << th) - 1) >> th, dt = (ld + (1u << td) - 1) >> td;
+        if (sparse && lw >= stw && lh >= sth) {   // a tiled level of a sparse texture: whole tiles
+            uint32_t tgw = stw * t.bpb / 64;
+            wt = (wt + tgw - 1) / tgw * tgw;
+            if (th < sgh) { uint32_t m = 1u << (sgh - th); ht = (ht + m - 1) / m * m; }
+        }
         off += (uint64_t)wt * ht * dt << (9 + th + td);
     }
     return off;
@@ -144,6 +175,8 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
         return;
     }
     unsigned tileH = 0, tileD = 0;
+    uint32_t stw, sth; unsigned sgh;
+    int sparse = sparse_tiled(d, t, w, h, &stw, &sth, &sgh);
     /* NVN truncates height*1.5 to whole GOB rows before choosing the power of
        two. Rounding up here changes e.g. 40 BC rows from H2 to H3 even when
        the total allocation size is unchanged, so padding becomes black texels. */
@@ -151,17 +184,19 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
         unsigned pl = (unsigned)(d->pkg_block_h - 1) & 0xFF;
         if (dpl >= 2) tileH = pl & 0xF;
         if (dpl == 3) tileD = pl >> 4;
-    } else if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = pick_tile((ah + ah / 2) / 8); }
+    } else if (sparse) tileH = sgh;                                   // nvn_tex_sparse_tile
+    else if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = pick_tile((ah + ah / 2) / 8); }
     else if (dpl == 3) tileD = pick_tile(z + z / 2);
     uint64_t ls = layer_bytes(d, dpl, layered, w, h, z, tileH, tileD, t);
-    if ((d->flags & 0x200) && !d->pkg_block_h && minimal_layout_on()) {
+    if ((d->flags & 0x200) && !d->pkg_block_h && !sparse && minimal_layout_on()) {
         uint64_t minimal = layer_bytes(d, dpl, layered, w, h, z, 0, 0, t);
         if (minimal != ls) { tileH = tileD = 0; ls = minimal; }
     }
+    uint64_t stride = sparse && layered ? (ls + 0xFFFF) & ~0xFFFFull : ls;
     o->tileH = tileH; o->tileD = tileD;
-    o->layer_size = ls;
-    o->size = layered ? ls * z : ls;
-    o->align = 512;
+    o->layer_size = stride;
+    o->size = layered ? stride * (z - 1) + ls : ls;
+    o->align = nvn_tex_sparse_tile(d, &stw, &sth, &sgh) ? 0x10000 : 512;
 }
 
 uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level) {

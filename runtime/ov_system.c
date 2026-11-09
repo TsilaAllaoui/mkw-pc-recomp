@@ -123,6 +123,17 @@ static void ov_desired_language(Cpu *c) {
 
 static void ov_oe_initialize(Cpu *c) { (void)c; rt_log("oe: application environment: a local host process"); }
 
+/* DKB_DISPLAY_VERSION_M14_6: nn::oe::DisplayVersion is a
+ * zero-terminated 16-byte field.  This is the installed update claimed by
+ * the SHA-pinned input set, not a fabricated SDK service object. */
+static void ov_display_version(Cpu *c) {
+    char *out = arg_p(c, 0);
+    if (!out) return;
+    memset(out, 0, 16);
+    memcpy(out, "1.8.0", sizeof "1.8.0" - 1);
+}
+
+
 // void SetPerformanceConfiguration(PerformanceMode mode, int config)
 static void ov_performance_config(Cpu *c) {
     int64_t mode = (int32_t)arg_x(c, 0);
@@ -794,6 +805,7 @@ HOST_OVERRIDE("_ZN2nn2oe31EnterExitRequestHandlingSectionEv", ov_exit_section);
 HOST_OVERRIDE("_ZN2nn2oe31LeaveExitRequestHandlingSectionEv", ov_exit_section);
 
 HOST_OVERRIDE("_ZN2nn2oe10InitializeEv", ov_oe_initialize);
+HOST_OVERRIDE("_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE", ov_display_version);
 HOST_OVERRIDE("_ZN2nn2oe18GetDesiredLanguageEv", ov_desired_language);
 HOST_OVERRIDE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", ov_performance_config);
 HOST_OVERRIDE("_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", ov_cpu_boost);

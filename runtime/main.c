@@ -163,6 +163,47 @@ void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) {
 }
 
 void rt_udf(Cpu *c, uint64_t pc) {
+    // DKB_GUEST_UDF_REGISTERS_V1: print guest register state BEFORE the existing fatal.
+    // This is diagnostic only; never convert a guest failure into success.
+    rt_log("DKB trap: pc=%#llx lr=%#llx sp=%#llx fp=%#llx tpidrro=%#llx",
+           (unsigned long long)pc, (unsigned long long)c->x[30],
+           (unsigned long long)c->sp, (unsigned long long)c->x[29],
+           (unsigned long long)c->tpidrro);
+    for (int i = 0; i < 30; i += 3) {
+        rt_log("DKB trap regs: x%d=%#llx x%d=%#llx x%d=%#llx",
+               i, (unsigned long long)c->x[i],
+               i + 1, (unsigned long long)c->x[i + 1],
+               i + 2, (unsigned long long)c->x[i + 2]);
+    }
+    // DKB_GUEST_UDF_HEAP_SNAPSHOT_V2: candidate words, not yet a diagnosed allocator.
+    // Check readability before dereferencing guest addresses; UDF remains fatal.
+    const uint64_t probe_addr[] = {c->x[0], c->x[1], c->x[8], c->x[19],
+                                   c->x[20], c->x[21], c->x[22], c->sp};
+    const char *probe_name[] = {"x0", "x1", "x8", "x19", "x20", "x21", "x22", "sp"};
+    for (unsigned i = 0; i < sizeof probe_addr / sizeof probe_addr[0]; i++) {
+        uint64_t a = probe_addr[i];
+        if (!a || (a & 7) || !plat_mem_readable(a, 32)) {
+            rt_log("DKB heap snapshot: %s=%#llx unavailable (or unaligned)",
+                   probe_name[i], (unsigned long long)a);
+            continue;
+        }
+        rt_log("DKB heap snapshot: %s=%#llx words=%#llx %#llx %#llx %#llx",
+               probe_name[i], (unsigned long long)a,
+               (unsigned long long)LD64(a), (unsigned long long)LD64(a+8),
+               (unsigned long long)LD64(a+16), (unsigned long long)LD64(a+24));
+    }
+    // AArch64 frame records contain [previous FP, return address].
+    // This may uncover which DKB routine requested the invalid free.
+    uint64_t fp = c->x[29];
+    for (int i = 0; i < 20 && fp && !(fp & 7) && plat_mem_readable(fp, 16); i++) {
+        uint64_t next = LD64(fp), ret = LD64(fp + 8);
+        char name[128];
+        rt_log("DKB guest frame %d: fp=%#llx prev=%#llx lr=%s", i,
+               (unsigned long long)fp, (unsigned long long)next,
+               ldr_describe(ret, name, sizeof name));
+        if (next <= fp || next - fp > (64ull << 20)) break;
+        fp = next;
+    }
     char at[128], lr[128];
     rt_fatal("undefined instruction at %s (lr %s)", ldr_describe(pc, at, sizeof at),
              ldr_describe(c->x[30], lr, sizeof lr));

@@ -21,6 +21,7 @@
 #include "cfg.h"
 #include "gfx.h"
 #include "host.h"
+#include "dkb_sparse_tex.h"
 #include "nvn_api.h"
 #include "nvn_hmap.h"
 #include "nvn_tex.h"
@@ -44,9 +45,12 @@ typedef struct Tex {
     VmaAllocation bound_to;       // the pool memory it is bound into
     uint32_t wgen;                // page generation of the last upload check
     uint32_t checked;             // submit_epoch of the last check from a draw binding
+    uint32_t used;                // submit_epoch of the last lookup or draw binding (sweep_idle)
     int uploaded, released;
     uint32_t n_up;                // uploads of this entry (vk_texture_debug)
     int last_ch;                  // last vk_mem_changed result of make_fresh: 1 written, 0 clean, -1 not tracked
+    uint8_t hashed;               // chash is the storage content represented by the current image
+    uint64_t chash;
     struct Tex *next_at;          // other entries at the same storage address
     uint8_t gpu_dirty;            // mirrored, and the GPU wrote the image after the last write-back to the storage
     uint32_t gpu_gen;             // page generation when the GPU write that set gpu_dirty was recorded
@@ -58,6 +62,7 @@ typedef struct Tex {
     uint8_t *snap;                // a texture that fills no page: its storage bytes when the GPU write was recorded
     uint32_t wt_n;                // WriteTexels into the storage since the last upload
     struct Tex *rel_prev, *rel_next;   // while released: the list of released entries, oldest first
+    DkbSparse *sparse;            // sparse-resident image (dkb_sparse_tex.c): tiles follow the page table
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -87,11 +92,15 @@ static nvn_hmap by_key = {.klen = sizeof(TexKey)};
 static nvn_hmap by_addr = {.klen = 8};
 static nvn_hmap descriptors = {.klen = sizeof(VkDescKey)};
 static nvn_hmap samplers = {.klen = sizeof(samp_par)};
+static nvn_hmap failed = {.klen = sizeof(TexKey)};   // entry_of: submit_epoch of a key's last failed image creation
+#define FAILED_RETRY 600
 static int nreleased;
 static Tex *rel_head, *rel_tail;   // released entries in release order (sweep_released drops from the head)
 static uint64_t n_uploads, n_reuploads;
 // Re-uploads since the last perf line (tex_lock): all, and those of textures a WriteTexels wrote since their last upload.
 static uint64_t ru_n, ru_bytes, ru_ns, ru_wt_n, ru_wt_bytes, ru_wt_ns;
+static uint64_t n_hash_kept;      // dirty-page answers whose bytes still match the current image
+static uint64_t n_hash_bytes, n_hash_ns;
 // TOTK_TEX_ALIAS (default on; =0: a new image over live storage starts empty): a new descriptor over the storage of a
 // live image that the GPU wrote gets that image's content (alias_copy). Counts since the last log line.
 static int tex_alias = -1;
@@ -154,6 +163,17 @@ static void make_key(const tex_t *t, TexKey *k) {
 // Keys equal apart from the descriptor's swizzle selectors: the same storage, format and geometry.
 static int same_but_swizzle(const TexKey *a, const TexKey *b) {
     TexKey x = *a, y = *b;
+    x.d.swizzle_r = x.d.swizzle_g = x.d.swizzle_b = x.d.swizzle_a = 0;
+    y.d.swizzle_r = y.d.swizzle_g = y.d.swizzle_b = y.d.swizzle_a = 0;
+    return !memcmp(&x, &y, sizeof x);
+}
+
+// Same sparse storage geometry. NVN descriptors for one sparse render array commonly differ in usage flags as well as
+// swizzle; Vulkan images here already carry every supported sampled, storage and attachment usage, so those flags do
+// not require another several-hundred-MiB backing.
+static int same_sparse_storage(const TexKey *a, const TexKey *b) {
+    TexKey x = *a, y = *b;
+    x.d.flags = y.d.flags = 0;
     x.d.swizzle_r = x.d.swizzle_g = x.d.swizzle_b = x.d.swizzle_a = 0;
     y.d.swizzle_r = y.d.swizzle_g = y.d.swizzle_b = y.d.swizzle_a = 0;
     return !memcmp(&x, &y, sizeof x);
@@ -279,7 +299,7 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
         VkImageSubresourceRange rg = {e->pub.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
         vkCmdClearDepthStencilImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
         barrier(cb, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
-    } else if (vk_fix_zero() && !e->bound_to && !e->pub.mirrored && !format_compressed(e->f.vk)) {
+    } else if (vk_fix_zero() && !e->bound_to && !e->pub.mirrored && !e->sparse && !format_compressed(e->f.vk)) {
         // GPU-only storage that got memory of its own starts at zero, as the pool it stands for (vk_memory.c
         // alloc_physical). Images aliasing pool memory are not cleared: that would erase what other textures rendered
         // there; mirrored images are uploaded from their storage on first use.
@@ -288,6 +308,83 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
         vkCmdClearColorImage(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
         barrier(cb, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, ALL_RW);
     }
+}
+
+// M15.23 read-only sparse feasibility audit, based on the source-specific 64 KiB guest tile sizes in KartNative's
+// rendering notes. This DOES NOT allocate sparse memory or bind a sparse image. A sparse VkImage requires its own
+// lifetime and correct 64 KiB tile residency (M15.24); creating an empty sparse image here would stay black.
+static void dkb_sparse_candidate_audit(const VkCtx *c, const nvn_texdesc *d, const VkImageCreateInfo *ci,
+                                       uint64_t gpu_addr, uint64_t guest_bytes) {
+    static volatile int32_t count;
+    const char *enabled = cfg_get("DKB_SPARSE_AUDIT");
+    if (!enabled || strcmp(enabled, "1") || !(d->flags & NVN_TEXTURE_FLAGS_SPARSE) ||
+        ci->imageType != VK_IMAGE_TYPE_2D || ci->samples != VK_SAMPLE_COUNT_1_BIT ||
+        guest_bytes < (16ull << 20) || plat_inc32(&count) > 24) return;
+    VkPhysicalDeviceFeatures ft;
+    vkGetPhysicalDeviceFeatures(c->phys, &ft);
+    int bw = 0, bh = 0, bpb = nvn_fmt_bpb(d->format, &bw, &bh);
+    uint32_t guest_w = 0, guest_h = 0;
+    switch (bpb) {
+    case 1: guest_w = 256, guest_h = 256; break;
+    case 2: guest_w = 256, guest_h = 128; break;
+    case 4: guest_w = 128, guest_h = 128; break;
+    case 8: guest_w = 128, guest_h = 64; break;
+    case 16: guest_w = 64, guest_h = 64; break;
+    }
+    guest_w *= bw, guest_h *= bh;
+    uint32_t n = 0;
+    // Probe the minimal usage of a sampled streamed texture, not the broader attachment/storage flags the
+    // ordinary texture cache adds for non-sparse surfaces. This is a capability audit, not an attempt to enable it.
+    VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (ft.sparseBinding && ft.sparseResidencyImage2D)
+        vkGetPhysicalDeviceSparseImageFormatProperties(c->phys, ci->format, VK_IMAGE_TYPE_2D,
+                                                        VK_SAMPLE_COUNT_1_BIT, u, VK_IMAGE_TILING_OPTIMAL, &n, NULL);
+    VkSparseImageFormatProperties sp[4];
+    uint32_t take = n > 4 ? 4 : n;
+    if (take) vkGetPhysicalDeviceSparseImageFormatProperties(c->phys, ci->format, VK_IMAGE_TYPE_2D,
+                                                              VK_SAMPLE_COUNT_1_BIT, u, VK_IMAGE_TILING_OPTIMAL,
+                                                              &take, sp);
+    int match = 0;
+    for (uint32_t i = 0; i < take; i++)
+        if (sp[i].imageGranularity.width == guest_w && sp[i].imageGranularity.height == guest_h &&
+            sp[i].imageGranularity.depth == 1 && !(sp[i].flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT))
+            match = 1;
+    rt_log("DKB-SPARSE-CANDIDATE: addr %#llx fmt %#x %ux%u layers %u levels %u guest %.1f MiB, "
+           "guest tile %ux%u px, feature binding=%d residency2D=%d properties=%u matching_simple=%d%s",
+           (unsigned long long)gpu_addr, d->format, ci->extent.width, ci->extent.height,
+           ci->arrayLayers, ci->mipLevels, guest_bytes / 1048576.0, guest_w, guest_h,
+           ft.sparseBinding, ft.sparseResidencyImage2D, n, match,
+           n && !match ? " (mip tail/granularity needs a different path)" : "");
+    for (uint32_t i = 0; i < take; i++)
+        rt_log("DKB-SPARSE-CANDIDATE:   Vulkan granularity %ux%ux%u flags %#x aspect %#x",
+               sp[i].imageGranularity.width, sp[i].imageGranularity.height, sp[i].imageGranularity.depth,
+               sp[i].flags, sp[i].aspectMask);
+}
+
+// Optional emergency guard. Refusing a live image makes course objects disappear, so the default is off; small cards
+// instead use ASTC-to-BC3 and released-cache pressure. A nonzero override remains useful for allocation diagnostics.
+static int dkb_own_memory_allowed(uint64_t guest_bytes) {
+    static int limit = -1;
+    static volatile int32_t skipped;
+    if (limit < 0) {
+        const char *s = cfg_get("TOTK_OWN_VRAM_LIMIT");
+        limit = s && *s ? atoi(s) : 0;
+        if (limit < 0 || limit > 100) limit = 0;
+        rt_log("DKB-MEMORY-STABILITY: own-memory texture creation limit %s%d%% of local budget "
+               "(TOTK_OWN_VRAM_LIMIT=0 disables)", limit ? "" : "off/", limit);
+    }
+    if (!limit) return 1;
+    uint64_t used, budget;
+    int exact;
+    if (!vk_mem_vram(&used, &budget, &exact) || !budget) return 1;
+    uint64_t ceiling = budget / 100 * (uint64_t)limit;
+    // guest_bytes is a lower bound for decoded/compressed images; the 15% reserve covers format expansion, staging,
+    // required pool imports and VMA block granularity. Saturating subtraction avoids an overflow at bad descriptors.
+    if (used < ceiling && guest_bytes < ceiling - used) return 1;
+    log_limited(&skipped, "DKB-MEMORY-STABILITY: own-memory texture skipped at %.0f/%.0f MiB local heap "
+                "(guest layout %.1f MiB, limit %d%%)", used / 1048576.0, budget / 1048576.0,
+                guest_bytes / 1048576.0, limit);
+    return 0;
 }
 
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
@@ -347,6 +444,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
                             .extent = {w, h, depth}, .mipLevels = levels, .arrayLayers = layers,
                             .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    VkImageCreateInfo plain = ci;   // a sparse-resident image gets no block views
     int bw, bh, block_views = 0;
     // TOTK_BLOCK_VIEWS_3D (default 0): a 3D BC image also gets block views. On RDNA2 cards (driver 26.10.1, issue #5)
     // the 32x32x32 BC4 volume the game creates at the logo, made BLOCK_TEXEL_VIEW_COMPATIBLE and 2D_ARRAY_COMPATIBLE,
@@ -389,7 +487,15 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     e->f = f;
     e->pub.addr = k->addr;
     VkImage img = VK_NULL_HANDLE;
-    if (nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
+    if (nvn_gpu_only(k->addr) && (d->flags & NVN_TEXTURE_FLAGS_SPARSE)) {
+        VkImageCreateInfo sci = plain;
+        if (fb_usage) sci.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+        if ((e->sparse = dkb_sparse_create(t, &f, &sci, &img))) {
+            ci = sci, usage = sci.usage, flags = sci.flags, block_views = 0;
+            fb_usage = (usage & VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) != 0;
+        }
+    }
+    if (!img && nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
         if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS && !bind_pool_memory(c, e, img, L.size)) {
             vkDestroyImage(c->device, img, NULL);
             img = VK_NULL_HANDLE;
@@ -398,6 +504,9 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         }
     }
     if (!img) {
+        // Audit runs only when DKB_SPARSE_AUDIT=1; it never changes image flags or failure behavior.
+        if (nvn_gpu_only(k->addr)) dkb_sparse_candidate_audit(c, d, &ci, k->addr, L.size);
+        if (!dkb_own_memory_allowed(L.size)) { free(e); return NULL; }
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VkResult r = vmaCreateImage(c->vma, &ci, &ai, &img, &e->alloc, NULL);
         if (r != VK_SUCCESS) {
@@ -509,6 +618,7 @@ static void destroy_tex(Tex *e) {
     if (e->released) nreleased--, rel_unlink(e);
     vk_exec_image_gone(e->pub.image);
     vk_defer_image(e->pub.image, e->alloc);
+    dkb_sparse_destroy(e->sparse);
     free(e->snap);
     free(e);
 }
@@ -523,7 +633,8 @@ static void sweep_released(void) {
     while (nreleased > RELEASED_MAX && rel_head) destroy_tex(rel_head);
 }
 
-// TOTK_TEX_VRAM_PRESSURE (percent of the device-local budget, default 90; 0 = off): above it, each submit drops up to
+// TOTK_TEX_VRAM_PRESSURE (percent of the device-local budget, default 80 on <=10 GiB and 90 otherwise; 0 = off):
+// above it, each submit drops up to
 // PRESSURE_STEP of the oldest released entries, so a 4 GiB card does not keep RELEASED_MAX released images (each ASTC
 // one decoded to RGBA8) while the heap spills into system memory. A few per submit, for the reason above. Only entries
 // that come back intact are dropped: mirrored ones the GPU never wrote, re-uploaded from their storage. A render target
@@ -531,16 +642,53 @@ static void sweep_released(void) {
 // "left uninitialised" aliases a minute).
 #define PRESSURE_STEP 32
 static int vram_pressure = -1;
-static uint64_t n_pressure_drops;
+static uint64_t n_pressure_drops, n_idle_drops;
+
+// Still above it, live entries no lookup or draw binding used for IDLE_EPOCHS submissions (~10 s) go too, oldest
+// first and with the same condition: DKB keeps thousands of course and menu textures registered (3 GiB of images on
+// an 8 GiB card with its sparse tiles, the heap past its budget and stuttering); one used again is made and uploaded
+// from its storage. TOTK_TEX_IDLE_DROP=0 keeps them.
+#define IDLE_EPOCHS 2400
+static int idle_drop = -1;
+
+static void sweep_idle(int n) {   // tex_lock held
+    if (idle_drop < 0) {
+        const char *s = cfg_get("TOTK_TEX_IDLE_DROP");
+        idle_drop = !(s && !strcmp(s, "0"));
+        rt_log("vk: textures idle for %d submits under VRAM pressure: %s", IDLE_EPOCHS, idle_drop ? "dropped" : "kept");
+    }
+    if (!idle_drop || n <= 0 || submit_epoch < IDLE_EPOCHS) return;
+    Tex *pick[PRESSURE_STEP];
+    int np = 0;
+    if (n > PRESSURE_STEP) n = PRESSURE_STEP;
+    for (uint32_t i = 0; i < by_key.cap; i++) {
+        Tex *e = by_key.vals[i];
+        if (!e || e->released || !e->alloc || e->sparse || !e->uploaded || !e->pub.mirrored || e->pub.gpu_owned ||
+            e->gpu_dirty || submit_epoch - e->used < IDLE_EPOCHS)
+            continue;
+        if (np < n) pick[np++] = e;
+        else {
+            int newest = 0;
+            for (int j = 1; j < np; j++)
+                if (submit_epoch - pick[j]->used < submit_epoch - pick[newest]->used) newest = j;
+            if (submit_epoch - e->used > submit_epoch - pick[newest]->used) pick[newest] = e;
+        }
+    }
+    for (int j = 0; j < np; j++) destroy_tex(pick[j]);
+    n_idle_drops += (uint64_t)np;
+}
 
 static void sweep_pressure(void) {   // tex_lock held
     if (vram_pressure < 0) {
         const char *s = cfg_get("TOTK_TEX_VRAM_PRESSURE");
-        vram_pressure = s && *s ? atoi(s) : 90;
-        if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = 90;
+        uint64_t used = 0, budget = 0;
+        int exact = 0;
+        int def = vk_mem_vram(&used, &budget, &exact) && budget && budget <= (10ull << 30) ? 80 : 90;
+        vram_pressure = s && *s ? atoi(s) : def;
+        if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = def;
         rt_log("vk: released textures under VRAM pressure: %s%d%%", vram_pressure ? "dropped above " : "off", vram_pressure);
     }
-    if (!vram_pressure || !rel_head || submit_epoch & 7) return;   // the budget query every 8 submits
+    if (!vram_pressure || submit_epoch & 7) return;   // the budget query every 8 submits
     uint64_t used, budget;
     int exact;
     if (!vk_mem_vram(&used, &budget, &exact) || used <= budget / 100 * (uint64_t)vram_pressure) return;
@@ -551,6 +699,7 @@ static void sweep_pressure(void) {   // tex_lock held
         destroy_tex(e);
         dropped++, n_pressure_drops++;
     }
+    sweep_idle(PRESSURE_STEP - dropped);
 }
 
 // ---------------------------------------------------------------- uploads
@@ -759,12 +908,54 @@ static int storage_rewritten(const Tex *e, uint32_t since, uint32_t *now) {
     return 0;
 }
 
+// A page can be marked written when DKB changed another allocation sharing it, and some large pools are conservatively
+// dirty for many descriptors. Hashing the actual storage before a re-upload distinguishes that from a real texture
+// update. This extends public DKB Recomp's untracked-page hash to tracked dirty answers, which DKB produces by the
+// thousands per race frame. Equal bytes are safe while the image is not GPU-owned: it still contains the last upload.
+static int tex_hash = -1;
+
+static inline uint64_t rotl64(uint64_t x, int r) { return x << r | x >> (64 - r); }
+
+static uint64_t storage_hash(const Tex *e) {
+    const uint8_t *p = (const uint8_t *)(uintptr_t)e->pub.addr;
+    uint64_t n = e->t.L.size, i = 0;
+    const uint64_t P1 = 0x9e3779b185ebca87ull, P2 = 0xc2b2ae3d27d4eb4full;
+    uint64_t a = P1 + P2, b = P2, c = 0, d = 0 - P1;
+    for (; i + 32 <= n; i += 32) {
+        uint64_t w[4];
+        memcpy(w, p + i, 32);
+        a = rotl64(a + w[0] * P2, 31) * P1;
+        b = rotl64(b + w[1] * P2, 31) * P1;
+        c = rotl64(c + w[2] * P2, 31) * P1;
+        d = rotl64(d + w[3] * P2, 31) * P1;
+    }
+    uint64_t h = rotl64(a, 1) + rotl64(b, 7) + rotl64(c, 12) + rotl64(d, 18) + n;
+    for (; i < n; i++) h = rotl64(h ^ (p[i] * P1), 11) * P2;
+    h ^= h >> 33, h *= P2, h ^= h >> 29, h *= P1, h ^= h >> 32;
+    return h;
+}
+
+static int storage_same(Tex *e, int changed) {
+    if (tex_hash < 0) tex_hash = cfg_bool("TOTK_TEX_HASH");
+    if (!changed || !tex_hash) { if (!tex_hash) e->hashed = 0; return 0; }
+    uint64_t t0 = plat_now_ns();
+    uint64_t h = storage_hash(e);
+    n_hash_ns += plat_now_ns() - t0;
+    n_hash_bytes += e->t.L.size;
+    int same = e->hashed && e->uploaded && h == e->chash;
+    e->chash = h, e->hashed = 1;
+    if (same) n_hash_kept++;
+    return same;
+}
+
 // A mirrored texture is uploaded on first use and again when its storage pages carry a newer write generation.
 static void make_fresh(Tex *e) {
+    if (e->sparse) { dkb_sparse_sync(e->sparse); e->uploaded = 1; return; }
     if (!e->pub.mirrored || e->pub.gpu_owned) return;
     uint64_t size = e->t.L.size;
     if (!e->uploaded) {
-        vk_mem_changed(e->pub.addr, size, 0, &e->wgen);   // resets the write bits before the storage is read
+        int ch = vk_mem_changed(e->pub.addr, size, 0, &e->wgen);   // reset write bits before reading storage
+        storage_same(e, ch);   // remember the bytes represented by the upload
         upload(e);
         return;
     }
@@ -772,21 +963,22 @@ static void make_fresh(Tex *e) {
     int ch = vk_mem_changed(e->pub.addr, size, e->wgen, &now);
     e->wgen = now;
     e->last_ch = ch;
-    if (ch) upload(e);   // 1 written, -1 not tracked: both upload again
+    if (ch && !storage_same(e, ch)) upload(e);   // upload only when the texture bytes actually changed
 }
 
 // make_fresh for draw bindings: the page check answers from this submission's write-watch snapshot (vk_memory.c
 // vk_mem_changed_snap) instead of a system call per texture. A write the snapshot of the texture's region missed (made
 // after it, during this replay) keeps its write-watch bit and is caught by the next submission's snapshot.
 static void make_fresh_snap(Tex *e) {
+    if (e->sparse) { dkb_sparse_sync(e->sparse); e->uploaded = 1; return; }
     if (!e->pub.mirrored || e->pub.gpu_owned) return;
     uint32_t now;
     n_checks++;
     int ch = vk_mem_changed_snap(e->pub.addr, e->t.L.size, e->uploaded ? e->wgen : 0, submit_epoch, &now);
     e->wgen = now;
-    if (!e->uploaded) { upload(e); return; }
+    if (!e->uploaded) { storage_same(e, ch); upload(e); return; }
     e->last_ch = ch;
-    if (ch) upload(e);
+    if (ch && !storage_same(e, ch)) upload(e);
 }
 
 // ---------------------------------------------------------------- aliases (TOTK_TEX_ALIAS)
@@ -804,6 +996,7 @@ static int img_block(const Tex *e, int *bw, int *bh) {
 // image formats of one block size.
 static int alias_compatible(const Tex *e, const Tex *src) {
     const VkTexImage *p = &e->pub, *q = &src->pub;
+    if (e->sparse || src->sparse) return 0;   // a copy would read or write unbound blocks
     if (e->f.depth || e->f.stencil || src->f.depth || src->f.stencil || p->samples > 1 || q->samples > 1) return 0;
     if (p->type != q->type || p->width != q->width || p->height != q->height || p->depth != q->depth) return 0;
     if (e->t.L.size != src->t.L.size || nvn_tex_is_linear(&e->t.d) != nvn_tex_is_linear(&src->t.d)) return 0;
@@ -872,12 +1065,35 @@ static Tex *entry_of(const tex_t *t) {
     TexKey k;
     make_key(t, &k);
     Tex *e = nvn_hm_get(&by_key, &k);
+    // DKB exposes the same large sparse array through several descriptors that differ only in swizzle. Vulkan cannot
+    // bind its tiled NVN storage, but allocating a fully resident fallback for every swizzle costs 1-2 GiB. Attachment
+    // writes ignore swizzle, and descriptor sampling already supplies the requested swizzle in slot_resolve, so these
+    // compatible views share the first live image at the address.
+    if (!e && (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) && t->L.size >= (64ull << 20)) {
+        for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
+            if (!p->released && same_sparse_storage(&p->key, &k)) {
+                static volatile int32_t n_sparse_shared;
+                log_limited(&n_sparse_shared, "DKB-SPARSE-SHARE: reused %.1f MiB image at %#llx for a swizzle alias",
+                            t->L.size / 1048576.0, (unsigned long long)k.addr);
+                e = p;
+                break;
+            }
+        }
+    }
     if (!e) {
         if (tex_alias < 0) {
             tex_alias = cfg_bool("TOTK_TEX_ALIAS");
             rt_log("vk: texture aliases: %s", tex_alias ? "a new image takes the live image's content" : "a new image starts empty");
         }
-        if (!(e = create_tex(t, &k, tex_alias))) return NULL;
+        // A key whose image creation failed is tried again only after FAILED_RETRY submissions: every draw binding
+        // retried the multi-GiB fallbacks of DKB's sparse arrays, an allocation attempt per lookup.
+        void *failed_at = failed.n ? nvn_hm_get(&failed, &k) : NULL;
+        if (failed_at && submit_epoch - (uint32_t)(uintptr_t)failed_at < FAILED_RETRY) return NULL;
+        if (!(e = create_tex(t, &k, tex_alias))) {
+            nvn_hm_put(&failed, &k, (void *)(uintptr_t)submit_epoch);
+            return NULL;
+        }
+        if (failed_at) nvn_hm_del(&failed, &k);
         perf_count(PERF_CNT_TEX_NEW);
         // released entries of another descriptor at this address are replaced by the new one; a live one holding
         // GPU-written content is the alias source, preferring the one that differs only in swizzle (same_but_swizzle)
@@ -916,6 +1132,7 @@ static Tex *entry_of(const tex_t *t) {
     }
     if (e->released) e->released = 0, nreleased--, rel_unlink(e), tex_gen_bump(k.addr);
     e->t = *t;
+    e->used = submit_epoch;
     return e;
 }
 
@@ -965,6 +1182,7 @@ void vk_texture_gpu_written(const tex_t *t) {
     Tex *e = entry_of(t);
     if (e) {
         make_fresh(e);   // a partial render keeps what the storage held before
+        if (e->sparse) dkb_sparse_gpu_written(e->sparse);
         e->pub.gpu_owned = 1;
         uint64_t f = vk_exec_recording_fence();
         if (f > e->wr_fence) e->wr_fence = f;
@@ -1139,6 +1357,7 @@ const VkTexImage *vk_texture_by_id_locked(const dpool_ref *pool, int id, view_t 
         s->cepoch = 0;
     }
     Tex *e = s->ce;
+    if (e) e->used = submit_epoch;
     // Bindings of one submit share one check, answered from the submit's write-watch snapshot (guest writes during a
     // replay race the GPU read on hardware too). After one check an entry is either uploaded or never uploads (not
     // mirrored, GPU-owned or no CPU layout), so a slot that checked its entry in this submit has nothing left to do.
@@ -1173,6 +1392,7 @@ uint32_t vk_texture_epoch(void) { return __atomic_load_n(&submit_epoch, __ATOMIC
 void vk_texture_new_submit(void) {
     lock();
     if (!++submit_epoch) submit_epoch = 1;
+    dkb_sparse_new_epoch(submit_epoch);
     sweep_pressure();
     static uint64_t log_at;
     uint64_t f = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) / 60;
@@ -1182,19 +1402,23 @@ void vk_texture_new_submit(void) {
                (unsigned long long)f * 60, (unsigned long long)n_alias_copied, (unsigned long long)n_alias_upload,
                (unsigned long long)n_alias_uninit);
         n_alias_copied = n_alias_upload = n_alias_uninit = 0;
-        rt_log("perf: frame %llu: texture re-uploads %llu (%.1f MiB, %.2f ms), after WriteTexels %llu (%.1f MiB, %.2f ms)",
+        rt_log("perf: frame %llu: texture re-uploads %llu (%.1f MiB, %.2f ms), after WriteTexels %llu (%.1f MiB, %.2f ms); "
+               "unchanged storage kept %llu, hashed %.1f MiB in %.2f ms",
                (unsigned long long)f * 60, (unsigned long long)ru_n, ru_bytes / 1048576.0, ru_ns / 1e6,
-               (unsigned long long)ru_wt_n, ru_wt_bytes / 1048576.0, ru_wt_ns / 1e6);
-        ru_n = ru_bytes = ru_ns = ru_wt_n = ru_wt_bytes = ru_wt_ns = 0;
+               (unsigned long long)ru_wt_n, ru_wt_bytes / 1048576.0, ru_wt_ns / 1e6,
+               (unsigned long long)n_hash_kept, n_hash_bytes / 1048576.0, n_hash_ns / 1e6);
+        ru_n = ru_bytes = ru_ns = ru_wt_n = ru_wt_bytes = ru_wt_ns = n_hash_kept = n_hash_bytes = n_hash_ns = 0;
         uint64_t ck, calls, untr;
         vk_mem_snap_stats(&ck, &calls, &untr);
         rt_log("perf: frame %llu: binding storage checks %llu (texture %llu), write-watch snapshot queries %llu, untracked %llu",
                (unsigned long long)f * 60, (unsigned long long)ck, (unsigned long long)n_checks, (unsigned long long)calls,
                (unsigned long long)untr);
         n_checks = 0;
-        rt_log("perf: frame %llu: released textures kept %d, dropped under VRAM pressure %llu", (unsigned long long)f * 60,
-               nreleased, (unsigned long long)n_pressure_drops);
-        n_pressure_drops = 0;
+        rt_log("perf: frame %llu: released textures kept %d, dropped under VRAM pressure %llu (idle live ones %llu)",
+               (unsigned long long)f * 60, nreleased, (unsigned long long)n_pressure_drops,
+               (unsigned long long)n_idle_drops);
+        n_pressure_drops = n_idle_drops = 0;
+        dkb_sparse_perf(f * 60);
     }
     unlock();
 }
@@ -1825,8 +2049,11 @@ void vk_texture_shutdown(void) {
         if (by_key.vals[i]) list[n++] = by_key.vals[i];
     for (int i = 0; i < n; i++) destroy_tex(list[i]);
     free(list);
+    dkb_sparse_shutdown();
     for (uint32_t i = 0; i < samplers.cap; i++)
         if (samplers.vals[i] && c) vkDestroySampler(c->device, (VkSampler)samplers.vals[i], NULL);
+    free(failed.keys), free(failed.vals);
+    failed = (nvn_hmap){.klen = sizeof(TexKey)};
     free(by_key.keys), free(by_key.vals), free(by_addr.keys), free(by_addr.vals), free(samplers.keys), free(samplers.vals);
     by_key = (nvn_hmap){.klen = sizeof(TexKey)};
     by_addr = (nvn_hmap){.klen = 8};

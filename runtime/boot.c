@@ -17,6 +17,7 @@
 #include "cfg.h"
 #include "fs.h"
 #include "gfx.h"
+#include "kernel.h"
 #include "nvn_api.h"
 #include "platform/platform.h"
 #include "vk.h"
@@ -60,9 +61,14 @@ static void check_npdm(void) {
     memcpy(&stack, npdm + 0x1C, 4);
     int prio = npdm[0xE], core = npdm[0xF];
     free(npdm);
-    if (prio != 44 || core != 0 || stack != 0x100000)
-        rt_fatal("boot: main.npdm asks for priority %d, core %d, stack %#x; kernel.c builds 44, 0, 0x100000", prio,
-                 core, stack);
+    // DKB_RECOMP_M2_NPDM_V1: honor each Switch 2 title's own NPDM instead of TotK's fixed values.
+    if (!rt_game_version) {
+        kern_configure_main_npdm(stack, prio, core);
+        rt_log("boot: Switch2 NPDM main stack=%#x priority=%d core=%d", stack, prio, core);
+    } else if (prio != 44 || core != 0 || stack != 0x100000) {
+        rt_fatal("boot: main.npdm asks for priority %d, core %d, stack %#x; expected 44, 0, 0x100000",
+                 prio, core, stack);
+    }
 }
 
 // ---- the three callbacks of nn::init::Start (rtld's job on hardware)
@@ -116,7 +122,26 @@ static void stats_line(void) {
 }
 
 void rt_boot_event(const char *what, Cpu *c, const char *detail) {
-    if (!rt_game_version) return;   // the expected call sites are TotK's main; Bananza has none pinned
+    // DKB_RECOMP_M2_NPDM_V1: optional Switch 2 checkpoint, no guessed DKB return addresses.
+    if (!rt_game_version) {
+        const char *trace = cfg_get("DKB_BOOT_TRACE");
+        if (trace && *trace && !strcmp(what, "nvn")) {
+            static volatile int32_t first_nvn;
+            if (!__atomic_exchange_n(&first_nvn, 1, __ATOMIC_RELAXED)) {
+                char at[128];
+                rt_log("boot: Switch2 FIRST_NVNCALL %s from %s", detail ? detail : "?",
+                       caller(c, at, sizeof at));
+                const char *stop = cfg_get("DKB_STOP_ON_NVN");
+                if (stop && !strcmp(stop, "1")) {
+                    stats_line();
+                    fflush(stdout);
+                    fflush(stderr);
+                    plat_exit(0);
+                }
+            }
+        }
+        return;
+    }
     char at[128];
     const RtLoaded *main_mod = module_named("main");
     uint64_t ret = c->x[30];

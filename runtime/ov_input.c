@@ -475,6 +475,37 @@ static void ov_six_state(Cpu *c) {
     ret_x(c, 0);
 }
 
+/* DKB_HID_APPLET_RESOURCE_M14_3:
+ * The host implements every HID state path used by DKB above instead of mapping
+ * Horizon's common HID shared memory.  JCMS has its own empty transfer-memory
+ * ring served by dkb_hid_jcms.c.  Preserve the SDK holder's Result ABI while
+ * making its reference bookkeeping host-owned. */
+static void ov_applet_resource_ok(Cpu *c) { ret_x(c, 0); }
+
+/* DKB_NMOUSE_OVERRIDE_M14_4: Switch 2 Nmouse is disconnected on the host.
+ * Initialize succeeds because the host has no transfer-memory producer to set
+ * up; enumeration returns no handles, so no state can be mistaken for live
+ * mouse input. */
+static void ov_nmouse_initialize(Cpu *c) {
+    static volatile int32_t logged;
+    once(&logged, "hid: the game initialized Nmouse (none connected on this host)", 0);
+    ret_x(c, 0);
+}
+static void ov_nmouse_finalize(Cpu *c) { ret_x(c, 0); }
+static void ov_nmouse_handles(Cpu *c) { ret_x(c, 0); }
+static void ov_nmouse_type_set(Cpu *c) {
+    uint32_t *out = arg_p(c, 0);
+    if (out) *out = 0;
+    ret_x(c, 1);
+}
+static void ov_nmouse_states(Cpu *c) {
+    int *count = arg_p(c, 0);
+    if (count) *count = 0;
+    ret_x(c, 1);
+}
+static void ov_nmouse_bool_ok(Cpu *c) { ret_x(c, 1); }
+static void ov_nmouse_void_ok(Cpu *c) { ret_x(c, 0); }
+
 // ---- Switch 2 SDK (Donkey Kong Bananza): public names for what TotK's SDK had under nn::hid::detail, and the
 // touch screen and Joy-Con assignment calls TotK never made.
 
@@ -504,6 +535,22 @@ static void ov_touch_state1(Cpu *c) {
 // NpadJoyDeviceType), Result MergeSingleJoyAsDualJoy(const NpadIdType &, const NpadIdType &): the host's one pad is
 // always a full controller, so the assignment mode changes nothing
 static void ov_joy_assignment(Cpu *c) { ret_x(c, 0); }
+
+HOST_OVERRIDE("_ZN2nn3hid6detail20AppletResourceHolder23SetAppletResourceUserIdENS_6applet20AppletResourceUserIdE",
+              ov_applet_resource_ok);
+HOST_OVERRIDE("_ZN2nn3hid6detail20AppletResourceHolder8ActivateEv", ov_applet_resource_ok);
+HOST_OVERRIDE("_ZN2nn3hid6detail20AppletResourceHolder10DeactivateEv", ov_applet_resource_ok);
+
+HOST_OVERRIDE("_ZN2nn3hid16InitializeNmouseEPvmii", ov_nmouse_initialize);
+HOST_OVERRIDE("_ZN2nn3hid16InitializeNmouseEPvmiiNS0_17NmousePointerTypeE", ov_nmouse_initialize);
+HOST_OVERRIDE("_ZN2nn3hid14FinalizeNmouseEv", ov_nmouse_finalize);
+HOST_OVERRIDE("_ZN2nn3hid16GetNmouseHandlesEPNS0_12NmouseHandleEij", ov_nmouse_handles);
+HOST_OVERRIDE("_ZN2nn3hid16GetNmouseTypeSetEPNS_4util10BitFlagSetILi32ENS0_10NmouseTypeEEENS0_12NmouseHandleE",
+              ov_nmouse_type_set);
+HOST_OVERRIDE("_ZN2nn3hid15GetNmouseStatesEPiPNS0_11NmouseStateEiNS0_12NmouseHandleE", ov_nmouse_states);
+HOST_OVERRIDE("_ZN2nn3hid19EnableNmousePointerENS0_12NmouseHandleEb", ov_nmouse_bool_ok);
+HOST_OVERRIDE("_ZN2nn3hid24SetNmousePointerPositionENS0_12NmouseHandleEii", ov_nmouse_bool_ok);
+HOST_OVERRIDE("_ZN2nn3hid22SetNmousePointerRangesEii", ov_nmouse_void_ok);
 
 HOST_OVERRIDE("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", ov_six_start);
 HOST_OVERRIDE("_ZN2nn3hid22GetSixAxisSensorStatesEPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE",

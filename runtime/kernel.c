@@ -36,6 +36,10 @@
 #define MAIN_STACK (1ull << 20)          // main.npdm META+0x1C
 #define MAIN_PRIO 44                     // META+0xE
 #define MAIN_CORE 0                      // META+0xF
+// DKB_RECOMP_M2_NPDM_V1: defaults unchanged for TotK and Bananza with matching NPDM.
+static uint64_t dkb_main_stack_size = MAIN_STACK;
+static int dkb_main_priority = MAIN_PRIO;
+static int dkb_main_core = MAIN_CORE;
 #define FIBER_MAX 1024
 
 enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_SESSION = KERN_SESSION, O_TMEM = KERN_TMEM };
@@ -1398,6 +1402,11 @@ static RtThread *thr_new(int prio, int core, uint64_t mask) {
 static void thr_link(RtThread *t) {   // holding G
     t->handle = h_new(O_THREAD, t);
     t->id = g_next_id++;
+    // DKB_SDK22_TLR_THREAD_ID_V1: SDK 22+ nn::os mutex owner ID may live at TLR+0x110.
+    // Mirror the already assigned kernel ID; keep TLR+0x1F8 untouched.
+    if (t->id == 0 || t->id > UINT32_MAX)
+        rt_fatal("DKB TLS: thread ID out of 32-bit TLR range");
+    *(uint32_t *)(void *)(t->tlr + 0x110) = (uint32_t)t->id;
     t->all = g_all;
     g_all = t;
     g_created++;
@@ -1482,6 +1491,17 @@ uint64_t kern_threads_created(void) {
 
 Cpu *kern_cpu(void) { return tcur ? tcur->cur : NULL; }
 
+void kern_configure_main_npdm(uint64_t stack_size, int priority, int core) {
+    const RtGuestLayout *layout = mem_layout();
+    if (g_main || tcur) rt_fatal("kernel: main thread already started");
+    if (!stack_size || (stack_size & 0xFFF) || stack_size > layout->stack.size ||
+        priority < 0 || priority > 63 || core < 0 || core >= NCORE)
+        rt_fatal("kernel: invalid NPDM main thread stack=%#llx priority=%d core=%d",
+                 (unsigned long long)stack_size, priority, core);
+    dkb_main_stack_size = stack_size;
+    dkb_main_priority = priority;
+    dkb_main_core = core;
+}
 uint32_t kern_main_thread(Cpu **cpu) {
     if (tcur) {
         if (!tcur->is_main) rt_fatal("kern_main_thread on guest thread %#x, not the main thread", tcur->handle);
@@ -1490,13 +1510,13 @@ uint32_t kern_main_thread(Cpu **cpu) {
     }
     if (g_main) rt_fatal("kern_main_thread: the main thread already runs on another host thread");
     const RtGuestLayout *L = mem_layout();
-    uint64_t stack = L->stack.base + L->stack.size - MAIN_STACK;
-    if (!plat_mem_commit(stack, MAIN_STACK))
+    uint64_t stack = L->stack.base + L->stack.size - dkb_main_stack_size;
+    if (!plat_mem_commit(stack, dkb_main_stack_size))
         rt_fatal("kernel: commit the main thread stack at %#llx failed", (unsigned long long)stack);
-    RtThread *t = thr_new(MAIN_PRIO, MAIN_CORE, 7);
+    RtThread *t = thr_new(dkb_main_priority, dkb_main_core, 7);
     t->started = 1;
     t->is_main = 1;
-    t->stack_top = stack + MAIN_STACK;
+    t->stack_top = stack + dkb_main_stack_size;
     t->cpu->sp = t->stack_top;
     t->tid = plat_thread_id();
     perf_main_thread();
@@ -1516,7 +1536,7 @@ uint32_t kern_main_thread(Cpu **cpu) {
 void kern_main_stack(uint64_t *base, uint64_t *size) {
     uint64_t b = __atomic_load_n(&g_main_stack, __ATOMIC_ACQUIRE);
     *base = b;
-    *size = b ? MAIN_STACK : 0;
+    *size = b ? dkb_main_stack_size : 0;
 }
 
 static void guest_main(void *p) {

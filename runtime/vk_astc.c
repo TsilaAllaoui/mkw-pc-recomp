@@ -300,7 +300,12 @@ static int create_pipeline(VkCtx *c) {
 // TOTK_ASTC_BC=1: the BC3 encoder, when the device samples BC3 (every desktop GPU does); 0 leaves ASTC as RGBA8.
 static int create_bc_pipeline(VkCtx *c) {
     const char *e = cfg_get("TOTK_ASTC_BC");
-    if (!e || !*e || *e == '0') return 0;
+    uint64_t used = 0, budget = 0;
+    int exact = 0;
+    int automatic = (!e || !*e) && vk_mem_vram(&used, &budget, &exact) && budget && budget <= (10ull << 30);
+    if ((!e || !*e) && !automatic) return 0;
+    if (e && *e == '0') return 0;
+    if (automatic) rt_log("vk: ASTC-to-BC3 enabled automatically for %.0f MiB local budget", budget / 1048576.0);
     VkFormatProperties p;
     vkGetPhysicalDeviceFormatProperties(c->phys, VK_FORMAT_BC3_SRGB_BLOCK, &p);
     VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;

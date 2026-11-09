@@ -1025,16 +1025,91 @@ static uint32_t delete_recursive(const char *path) {
     return remove_tree(p) ? FS_R_INVALID_ARGUMENT : 0;
 }
 
+// DKB-ROMFS-DIRECTORY (M15.21): a RomFS folder is listed from the RomFS index (romfs.c), which is sorted by path:
+// the rows under "<folder>/" are contiguous, and the first component of each below the folder is a file when it is the
+// rest of the row, else a subfolder (listed once). Files an overlay manifest adds are listed too. A folder no row lies
+// under does not exist: the index holds files only. DKB lists content:/Phive/StaticCompoundBody/<stage> once its
+// title screen is up.
+static uint64_t romfs_lower(const char *s) {
+    uint64_t lo = 0, hi = romfs_file_count();
+    while (lo < hi) {
+        uint64_t m = lo + (hi - lo) / 2;
+        if (strcmp(romfs_entry(m, NULL, NULL), s) < 0) lo = m + 1;
+        else hi = m;
+    }
+    return lo;
+}
+
+static int listing_has(const Listing *l, const char *name) {
+    for (int i = 0; i < l->n; i++)
+        if (!strcmp(l->e[i].name, name)) return 1;
+    return 0;
+}
+
+// rest: a RomFS path below the folder. any_order: rest may repeat an entry listed anywhere before (overlay files),
+// not only the last one (index rows, sorted).
+static void romfs_listing_add(Listing *l, const char *rest, uint64_t size, int any_order) {
+    const char *slash = strchr(rest, '/');
+    char name[PATH_CAP];
+    size_t n = slash ? (size_t)(slash - rest) : strlen(rest);
+    if (!n || n >= sizeof name) return;
+    memcpy(name, rest, n);
+    name[n] = 0;
+    int dup = any_order ? listing_has(l, name)
+                        : slash && l->n && l->e[l->n - 1].kind == PLAT_FS_DIR && !strcmp(l->e[l->n - 1].name, name);
+    if (!dup) listing_add(name, slash ? PLAT_FS_DIR : PLAT_FS_FILE, slash ? 0 : size, l);
+}
+
+static uint32_t romfs_listing(const char *path, Listing *l) {
+    static volatile int32_t n_logged;
+    *l = (Listing){0};
+    const char *rel = strchr(path, ':');
+    if (!rel || rel[1] != '/') return FS_R_INVALID_PATH;
+    for (rel += 2; *rel == '/'; rel++) {}
+    char prefix[PATH_CAP];
+    size_t n = strlen(rel);
+    while (n && rel[n - 1] == '/') n--;
+    if (n + 2 > sizeof prefix) return FS_R_INVALID_PATH;
+    memcpy(prefix, rel, n);
+    prefix[n] = 0;
+    if (n && !romfs_path_valid_relative(prefix)) return FS_R_INVALID_PATH;
+    if (n) prefix[n++] = '/', prefix[n] = 0;
+    uint64_t count = romfs_file_count(), size;
+    for (uint64_t i = romfs_lower(prefix); i < count; i++) {
+        const char *name = romfs_entry(i, NULL, &size);
+        if (strncmp(name, prefix, n)) break;
+        romfs_listing_add(l, name + n, size, 0);
+    }
+    for (size_t k = 0; k < romfs_overlay_count(); k++) {
+        const char *file, *name;
+        int added;
+        if ((name = romfs_overlay(k, &file, &size, &added)) && added && !strncmp(name, prefix, n))
+            romfs_listing_add(l, name + n, size, 1);
+    }
+    if (n && !l->n) return FS_R_PATH_NOT_FOUND;
+    if (plat_inc32(&n_logged) <= 32)
+        rt_log("DKB-ROMFS-DIRECTORY: %s: %d entries from the RomFS index (M15.21)", path, l->n);
+    return 0;
+}
+
 static uint32_t open_directory(uint64_t *out, const char *path, int mode) {
-    if (romfs_owns(path)) rt_fatal("fs: OpenDirectory on the RomFS (%s) is not implemented", path);
-    char p[PATH_CAP];
-    uint32_t r = host_path(path, p, sizeof p);
-    if (r) return r;
-    if (!out || mode < 1 || mode > 3) return FS_R_INVALID_ARGUMENT;
-    if (plat_fs_kind(p) != PLAT_FS_DIR) return FS_R_PATH_NOT_FOUND;
     Listing l;
-    int e = list_dir(p, &l);
-    if (e) return fs_result(e);
+    if (romfs_owns(path)) {
+        if (!out || mode < 1 || mode > 3) return FS_R_INVALID_ARGUMENT;
+        uint32_t r = romfs_listing(path, &l);
+        if (r) {
+            listing_free(l.e, l.n);
+            return r;
+        }
+    } else {
+        char p[PATH_CAP];
+        uint32_t r = host_path(path, p, sizeof p);
+        if (r) return r;
+        if (!out || mode < 1 || mode > 3) return FS_R_INVALID_ARGUMENT;
+        if (plat_fs_kind(p) != PLAT_FS_DIR) return FS_R_PATH_NOT_FOUND;
+        int e = list_dir(p, &l);
+        if (e) return fs_result(e);
+    }
     plat_mutex_lock(&lock);
     for (int i = 0; i < NDIRS; i++)
         if (!dirs[i].used) {

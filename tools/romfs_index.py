@@ -65,11 +65,17 @@ def write(romfs, out):
     """Write romfs-index.bin and romfs_config.h into out. Returns (file count, index bytes, seconds)."""
     t0 = time.monotonic()
     manifest = json.loads((romfs / 'index.json').read_text(encoding='utf-8'))
-    if manifest.get('status') != 'pass':
-        sys.exit(f'romfs_index: {romfs / "index.json"} does not record a verified extraction')
-    image = romfs / 'romfs.bin'
-    if not image.is_file() or image.stat().st_size != manifest['romfs_size']:
-        sys.exit(f'romfs_index: {image} is missing or its size differs from index.json')
+    # DKB_LOOSE_ROMFS_V1: inventory-only manifest identifies direct loose-file access.
+    loose = manifest.get('backend') == 'dkb-loose-v1'
+    if loose:
+        if manifest.get('status') != 'inventory-only' or not (romfs / 'loose-root.txt').is_file():
+            sys.exit('romfs_index: incomplete DKB loose RomFS inventory')
+    else:
+        if manifest.get('status') != 'pass':
+            sys.exit(f'romfs_index: {romfs / "index.json"} does not record a verified extraction')
+        image = romfs / 'romfs.bin'
+        if not image.is_file() or image.stat().st_size != manifest['romfs_size']:
+            sys.exit(f'romfs_index: {image} is missing or its size differs from index.json')
     index = build_index(manifest)
     count = len(manifest['files'])
     write_if_changed(out / 'romfs-index.bin', index)
@@ -79,6 +85,8 @@ def write(romfs, out):
               f'#define ROMFS_IMAGE_SHA256 "{manifest["romfs_sha256"].lower()}"\n'
               f'#define ROMFS_INDEX_SHA256 "{hashlib.sha256(index).hexdigest()}"\n'
               f'#define ROMFS_FILE_COUNT {count}ull\n')
+    if loose:
+        config += '#define ROMFS_LOOSE 1\n'
     write_if_changed(out / 'romfs_config.h', config.encode())
     return count, len(index), time.monotonic() - t0
 

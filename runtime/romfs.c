@@ -46,6 +46,10 @@ static uint64_t file_count, strings_offset;
 static PlatFile *image;
 static const uint8_t *image_map;
 static char image_file[2048];
+// DKB_LOOSE_ROMFS_V1: existing loose files are opened by path, not copied to romfs.bin.
+#ifdef ROMFS_LOOSE
+static char loose_root[2048];
+#endif
 static char index_dir[2048];         // the directory of romfs-index.bin: the proof file's default place
 static char mount_name[32];
 static PlatMutex lock = PLAT_MUTEX_INIT;
@@ -509,6 +513,20 @@ static void init_once(void *param) {
     double t0 = now_s();
     load_index();
     const char *dir = rt_config()->romfs;
+#ifdef ROMFS_LOOSE
+    char root_file[2100];
+    need(snprintf(root_file, sizeof root_file, "%s/loose-root.txt", dir) < (int)sizeof root_file,
+         "loose root config path");
+    FILE *source = fopen(root_file, "rb");
+    need(source != NULL, "loose-root.txt missing; rebuild or restage the DKB loose inventory");
+    need(fgets(loose_root, sizeof loose_root, source) != NULL, "loose root missing");
+    fclose(source);
+    loose_root[strcspn(loose_root, "\r\n")] = 0;
+    need(loose_root[0] != 0, "empty loose root path");
+    need(snprintf(image_file, sizeof image_file, "%s", loose_root) < (int)sizeof image_file,
+         "loose image path");
+    rt_log("RomFS: loose folder %s (no romfs.bin)", loose_root);
+#else
     need(snprintf(image_file, sizeof image_file, "%s/romfs.bin", dir) < (int)sizeof image_file, "image path");
     image = open_read(image_file);
     if (!image) rt_fatal("RomFS image %s missing; put romfs.bin into the romfs folder next to totk or set TOTK_ROMFS",
@@ -530,6 +548,7 @@ static void init_once(void *param) {
             rt_log("RomFS: mapping failed; using positional reads");
         }
     }
+#endif  // ROMFS_LOOSE
     overlay_init();
     rt_log("RomFS ready: %llu files, %zu overlays, %zu added, %.2f s", (unsigned long long)file_count, noverlay,
            nadded, now_s() - t0);
@@ -609,6 +628,24 @@ uint32_t romfs_open(uint64_t *out, const char *path, int mode) {
         if (!f || memcmp(&id, &o->id, sizeof id))
             rt_fatal("RomFS overlay %s is missing or changed since the start check (restart the game)", o->path);
     }
+#ifdef ROMFS_LOOSE
+    if (!ov) {
+        Entry e = entry(i);
+        const char *rel = entry_name(e);
+        if (!romfs_path_valid_relative(rel))
+            rt_fatal("RomFS loose: invalid indexed path %s", rel);
+        char full[4096];
+        if (snprintf(full, sizeof full, "%s/%s", loose_root, rel) >= (int)sizeof full)
+            rt_fatal("RomFS loose: path too long: %s", rel);
+        f = open_read(full);
+        if (!f) rt_fatal("RomFS loose: original file missing: %s", full);
+        PlatFileId info;
+        need(plat_file_id(f, &info), "loose file metadata");
+        if (info.size != e.size)
+            rt_fatal("RomFS loose: %s size changed (indexed %llu, actual %llu); rebuild",
+                     full, (unsigned long long)e.size, (unsigned long long)info.size);
+    }
+#endif
     plat_mutex_lock(&lock);
     for (unsigned j = 1; j < NH; j++)
         if (!handles[j]) {
@@ -640,8 +677,13 @@ static int handle_source(uint64_t h, PlatFile **f, uint64_t *base, uint64_t *siz
         *size = overlays[ov - 1].size;
     } else {
         Entry e = entry(i - 1);
+#ifdef ROMFS_LOOSE
+        *f = of;
+        *base = 0;
+#else
         *f = image;
         *base = e.offset;
+#endif
         *size = e.size;
     }
     return 1;
@@ -682,7 +724,11 @@ void romfs_close(uint64_t h) {
         rt_fatal("RomFS: close of invalid file handle %#llx", (unsigned long long)h);
     uint64_t j = h - ROMFS_HANDLE_BASE;
     plat_mutex_lock(&lock);
+#ifdef ROMFS_LOOSE
+    PlatFile *of = handle_file[j];
+#else
     PlatFile *of = handle_ovl[j] ? handle_file[j] : NULL;
+#endif
     handles[j] = 0;
     handle_ovl[j] = 0;
     handle_file[j] = NULL;

@@ -78,7 +78,8 @@ void rt_sha256(const void *p, size_t n, uint8_t out[32]);   // BCrypt; fatal if 
 #define RT_HOSTFN_BASE 0x7020000000ull
 // The game's application/program id (main.npdm ACI0): Donkey Kong Bananza. GetInfo 18 returns it and save data is
 // kept for it alone.
-#define RT_APPLICATION_ID 0x040074a01bf12000ull
+// DKB_RECOMP_M2_NPDM_V1: DKB program ID (local research checkout only).
+#define RT_APPLICATION_ID 0x0400C3F00006E000ull
 #define RT_HOSTFN_SIZE 0x100000ull
 
 // ---- AAPCS64 argument access for host functions (section 2.2)

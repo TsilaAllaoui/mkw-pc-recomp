@@ -526,6 +526,9 @@ static int decoded_astc_sub(const tex_t *t, const view_t *v, int has_v, const NV
     if (s->x % f->astc_bw || s->y % f->astc_bh ||
         (s->w % f->astc_bw && (uint32_t)s->x + s->w != w) ||
         (s->h % f->astc_bh && (uint32_t)s->y + s->h != h)) return 0;
+    // BC3 images (TOTK_ASTC_BC) copy whole 4x4 blocks: also a BC3 block on each side, or the mip's edge.
+    if (f->astc_bc && (s->x % 4 || s->y % 4 || (s->w % 4 && (uint32_t)s->x + s->w != w) ||
+                       (s->h % 4 && (uint32_t)s->y + s->h != h))) return 0;
     return 1;
 }
 
@@ -536,9 +539,10 @@ static int copy_decoded_astc(VkExec *ex, const p_copy_t2t *p) {
     if (!p->src || p->src->d.format < 0x79 || p->src->d.format > 0x94) return 0;
     TexVkFormat f;
     if (!tex_vk_format(p->src->d.format, &f) || !f.astc_bw) return 0;
-    if (!p->dst || p->src->d.format != p->dst->d.format || f.astc_bc || p->flags ||
-        (f.vk != VK_FORMAT_R8G8B8A8_UNORM && f.vk != VK_FORMAT_R8G8B8A8_SRGB)) {
-        warn_once(W_COPY, "decoded ASTC copy requires matching RGBA8 formats and no copy flags: skipped");
+    int bc3 = f.vk == VK_FORMAT_BC3_UNORM_BLOCK || f.vk == VK_FORMAT_BC3_SRGB_BLOCK;
+    if (!p->dst || p->src->d.format != p->dst->d.format || p->flags ||
+        (f.astc_bc ? !bc3 : f.vk != VK_FORMAT_R8G8B8A8_UNORM && f.vk != VK_FORMAT_R8G8B8A8_SRGB)) {
+        warn_once(W_COPY, "decoded ASTC copy requires matching RGBA8 or BC3 formats and no copy flags: skipped");
         return 1;
     }
     uint64_t sa = (uintptr_t)p->src->mem, da = (uintptr_t)p->dst->mem;

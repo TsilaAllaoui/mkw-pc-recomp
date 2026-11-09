@@ -34,7 +34,8 @@
 // Application pool: Switch 2 games are said to get about 9 GiB of the 12 (not measured on hardware; TOTK_APP_POOL
 // overrides). TotK's retail Switch 1 pool was 0xCD500000.
 #define DEFAULT_POOL (9 * GiB)
-#define SYSTEM_RESOURCE_BUDGET (32ull << 20)
+// DKB_RECOMP_M2_NPDM_V1: DKB main.npdm system resource budget.
+#define SYSTEM_RESOURCE_BUDGET (64ull << 20)
 #define MAX_STACK_MAPS 4096
 #define REEXEC_LIMIT 20
 

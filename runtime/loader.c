@@ -321,13 +321,53 @@ static void mark_used(int observers, const char *name) {
         if (!strcmp(hostfn_table_name(observers, i), name)) (observers ? obs_used : ovr_used)[i] = 1;
 }
 
-// Order (MNG loader.c:216-224): observer (JUMP_SLOT only), override by name, own definition, other modules in load
-// order, weak -> 0, strong -> named fatal stub. Overrides also replace a module's own symbols.
+// Horizon rtld (ModuleObject::TryResolveSymbol): a symbol with non-default visibility binds inside its own module;
+// any other reference takes the first global or weak definition in load order, so main's definition interposes over
+// a later module's. DKB depends on it: the SDK's sized-delete and allocation thunks must reach main's replacement
+// operator new/delete, or game-heap pointers are freed into the SDK CentralHeap. DKB_RTLD_SYMBOLIC=1 restores the
+// previous own-definition-first order for A/B diagnosis.
+static uint64_t interposed;
+static int rtld_symbolic = -1;
+
+static uint64_t global_symbol(const char *name) {
+    for (int i = 0; i < nmods; i++) {
+        const Mod *g = &mods[i];
+        for (uint32_t p = fnv(name) & g->hash_mask; g->hash[p]; p = (p + 1) & g->hash_mask) {
+            uint32_t k = g->hash[p];
+            if (strcmp(name, sym_name(g, k))) continue;
+            if (g->syms[k].info >> 4) return g->pub.base + g->syms[k].value;
+            break;
+        }
+    }
+    return 0;
+}
+
+static uint64_t bind_guest(const Mod *m, uint32_t si, const char *name) {
+    if (!sym_defined(m, si)) return find_symbol(name, NULL);
+    uint64_t own = m->pub.base + m->syms[si].value;
+    if (rtld_symbolic < 0) {
+        const char *e = getenv("DKB_RTLD_SYMBOLIC");
+        rtld_symbolic = e && *e == '1';
+        if (rtld_symbolic) rt_log("loader: DKB_RTLD_SYMBOLIC=1, own definitions bind first (NOT Horizon rtld order)");
+    }
+    if (rtld_symbolic || (m->syms[si].other & 3)) return own;
+    uint64_t global = global_symbol(name);
+    if (!global || global == own) return own;
+    if (++interposed <= 96) {
+        char d[160];
+        rt_log("loader: %s %s bound to %s (Horizon rtld load order)", m->pub.name, name,
+               ldr_describe(global, d, sizeof d));
+    }
+    return global;
+}
+
+// Order (MNG loader.c:216-224): observer (JUMP_SLOT only), override by name, guest definition in Horizon rtld order
+// (bind_guest), weak -> 0, strong -> named fatal stub. Overrides also replace a module's own symbols.
 static Res resolve(Mod *m, uint32_t si, int jump) {
     Res *cache = jump ? &m->res_jump[si] : &m->res_plain[si];
     if (cache->kind != RES_UNSET) return *cache;
     const char *name = sym_name(m, si);
-    uint64_t guest = sym_defined(m, si) ? m->pub.base + m->syms[si].value : find_symbol(name, NULL);
+    uint64_t guest = bind_guest(m, si, name);
     GuestFn f;
     Res r;
     if (jump && (f = hostfn_observer(name))) {
@@ -458,6 +498,8 @@ void ldr_load(const char *exefs_dir) {
         count_imports(&mods[i]);
         mods[i].pub.ctor_flag = decode_ctor_flag(&mods[i]);
     }
+    rt_log("loader: %llu default-visibility definitions interposed by an earlier module (Horizon rtld load order)",
+           (unsigned long long)interposed);
     verify_identity();
     for (int i = 0; i < nmods; i++) seal(&mods[i]);
     for (int i = 0; i < nmods; i++) {

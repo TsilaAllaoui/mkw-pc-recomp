@@ -2816,6 +2816,76 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
     VK_MEM_BOUND(ib);
 }
 
+// vkCmdDraw*IndirectCount have no recorder packet (vk_rec.h REC_CMDS): like any such call, it waits for the ring
+// to empty and is then made at once, after the binds and the pass begin queued before it (M15.18).
+static void indirect_count_drain(void) {
+    static int logged;
+    if (!logged++) rt_log("DKB-INDIRECT-COUNT-RECORDER: GPU-count draws are made after the recorder ring empties (M15.18)");
+    rec_drain();
+}
+
+// NVN indirect-count multi-draws map directly to Vulkan 1.2's GPU-count commands. Both the count and draw records can
+// be written by earlier compute culling, so neither is read on the CPU. Kartnative uses an equivalent GPU masking pass
+// because Metal has no indirect-count command; Vulkan preserves the operation without that expansion.
+static void op_draw_ind_count(VkExec *ex, const p_draw_ind_count *d) {
+    c0_binst = 0;
+    if (d->max <= 0) return;
+    if (d->stride < (int)sizeof(VkDrawIndirectCommand) || (d->stride & 3))
+        return warn_once(W_INDIRECT, "indirect-count array draw has invalid stride %d: draws skipped", d->stride);
+    VkMemSpan ip, cp;
+    uint64_t bytes = (uint64_t)(d->max - 1) * (uint64_t)d->stride + sizeof(VkDrawIndirectCommand);
+    if (!vk_mem_resolve(d->ind, bytes, &ip) || ip.offset % 4 ||
+        !vk_mem_resolve(d->count, sizeof(uint32_t), &cp) || cp.offset % 4)
+        return warn_once(W_INDIRECT, "indirect-count array arguments at %#llx / count %#llx are not backed or aligned: draws skipped",
+                         (unsigned long long)d->ind, (unsigned long long)d->count);
+    if (!prepare_draw(ex, d->prim, 0x7fffffff, 0)) return;
+    vk_exec_frame.draws++;
+    VK_MEM_USE(ip); VK_MEM_USE(cp);
+    indirect_count_drain();
+    vkCmdDrawIndirectCount(ex->cb, ip.buffer, ip.offset, cp.buffer, cp.offset, (uint32_t)d->max, (uint32_t)d->stride);
+    ex->recorded++;
+    note_work(ex, 1, 0);
+    if (!ip.alloc && vk_sync_noting()) vk_sync_note_args(d->ind);
+    if (!cp.alloc && vk_sync_noting()) vk_sync_note_args(d->count);
+    vk_mem_count(ip.cls, VK_MUSE_IND, bytes);
+    vk_mem_count(cp.cls, VK_MUSE_IND, sizeof(uint32_t));
+    VK_MEM_BOUND(ip); VK_MEM_BOUND(cp);
+}
+
+static void op_draw_idx_ind_count(VkExec *ex, const p_draw_idx_ind_count *d) {
+    c0_binst = 0;
+    if (d->max <= 0) return;
+    if (d->itype != NVN_INDEX_TYPE_UNSIGNED_SHORT && d->itype != NVN_INDEX_TYPE_UNSIGNED_INT)
+        return warn_once(W_INDEX, "indirect-count draw with index type %d: skipped", d->itype);
+    if (d->stride < (int)sizeof(VkDrawIndexedIndirectCommand) || (d->stride & 3))
+        return warn_once(W_INDIRECT, "indirect-count indexed draw has invalid stride %d: draws skipped", d->stride);
+    VkMemSpan ib, ip, cp;
+    uint64_t bytes = (uint64_t)(d->max - 1) * (uint64_t)d->stride + sizeof(VkDrawIndexedIndirectCommand);
+    int isize = d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? 2 : 4;
+    if (!vk_mem_resolve(d->ind, bytes, &ip) || ip.offset % 4 ||
+        !vk_mem_resolve(d->count, sizeof(uint32_t), &cp) || cp.offset % 4)
+        return warn_once(W_INDIRECT, "indirect-count indexed arguments at %#llx / count %#llx are not backed or aligned: draws skipped",
+                         (unsigned long long)d->ind, (unsigned long long)d->count);
+    if (!vk_mem_resolve(d->ibuf, 1, &ib) || ib.offset % (uint64_t)isize)
+        return warn_once(W_INDEX, "index buffer %#llx is not backed or aligned: indirect-count draws skipped",
+                         (unsigned long long)d->ibuf);
+    if (!prepare_draw(ex, d->prim, 0x7fffffff, restart_for(ex, d->prim, d->itype))) return;
+    vk_exec_frame.draws++;
+    VK_MEM_USE(ip); VK_MEM_USE(cp); VK_MEM_USE(ib);
+    vkCmdBindIndexBuffer(ex->cb, ib.buffer, ib.offset,
+                         d->itype == NVN_INDEX_TYPE_UNSIGNED_SHORT ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+    indirect_count_drain();
+    vkCmdDrawIndexedIndirectCount(ex->cb, ip.buffer, ip.offset, cp.buffer, cp.offset,
+                                  (uint32_t)d->max, (uint32_t)d->stride);
+    ex->recorded += 2;
+    note_work(ex, 1, 0);
+    if (!ip.alloc && vk_sync_noting()) vk_sync_note_args(d->ind);
+    if (!cp.alloc && vk_sync_noting()) vk_sync_note_args(d->count);
+    vk_mem_count(ip.cls, VK_MUSE_IND, bytes);
+    vk_mem_count(cp.cls, VK_MUSE_IND, sizeof(uint32_t));
+    VK_MEM_BOUND(ip); VK_MEM_BOUND(cp); VK_MEM_BOUND(ib);
+}
+
 // ---- dispatch and uniform buffer updates
 
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
@@ -2920,7 +2990,8 @@ static void geometry_context_buffer_log(unsigned record, const char *name, const
 
 // Opt-in draw-ingress metadata only. Replay is serialized; the cap is process-wide and later draws are unobserved.
 static void geometry_context_log(const VkExec *ex, uint32_t op, const void *payload) {
-    if (op != OP_DRAW && op != OP_DRAW_IDX && op != OP_DRAW_IDX_IND) return;
+    if (op != OP_DRAW && op != OP_DRAW_IDX && op != OP_DRAW_IDX_IND &&
+        op != OP_DRAW_IND_COUNT && op != OP_DRAW_IDX_IND_COUNT) return;
     static int on = -1, filtered;
     static uint64_t filter;
     static unsigned records;
@@ -2979,11 +3050,22 @@ static void geometry_context_log(const VkExec *ex, uint32_t op, const void *payl
         kind = "indexed", prim = d->prim;
         snprintf(draw, sizeof draw, "count=%d instances_raw=%d base_vertex=%d base_instance=%d index_type=%d index_addr=%#llx",
                  d->count, d->instances, d->base_vertex, d->base_instance, d->itype, (unsigned long long)d->ibuf);
-    } else {
+    } else if (op == OP_DRAW_IDX_IND) {
         const p_draw_idx_ind *d = payload;
         kind = "indexed_indirect", prim = d->prim;
         snprintf(draw, sizeof draw, "index_type=%d index_addr=%#llx indirect_addr=%#llx count=unknown instances=unknown",
                  d->itype, (unsigned long long)d->ibuf, (unsigned long long)d->ind);
+    } else if (op == OP_DRAW_IND_COUNT) {
+        const p_draw_ind_count *d = payload;
+        kind = "indirect_count", prim = d->prim;
+        snprintf(draw, sizeof draw, "indirect_addr=%#llx count_addr=%#llx max=%d stride=%d",
+                 (unsigned long long)d->ind, (unsigned long long)d->count, d->max, d->stride);
+    } else {
+        const p_draw_idx_ind_count *d = payload;
+        kind = "indexed_indirect_count", prim = d->prim;
+        snprintf(draw, sizeof draw, "index_type=%d index_addr=%#llx indirect_addr=%#llx count_addr=%#llx max=%d stride=%d",
+                 d->itype, (unsigned long long)d->ibuf, (unsigned long long)d->ind,
+                 (unsigned long long)d->count, d->max, d->stride);
     }
     if (ex->has_vp)
         snprintf(viewport, sizeof viewport, "has_vp=1 viewport0_stored=[%.9g,%.9g,%.9g,%.9g,%.9g,%.9g] depth_range=[%.9g,%.9g]",
@@ -3132,6 +3214,8 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
     case OP_DISPATCH: op_dispatch(ex, payload); break;
     case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
+    case OP_DRAW_IND_COUNT: op_draw_ind_count(ex, payload); break;
+    case OP_DRAW_IDX_IND_COUNT: op_draw_idx_ind_count(ex, payload); break;
     case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }

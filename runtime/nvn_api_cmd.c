@@ -811,6 +811,30 @@ NVN_API(nvnCommandBufferDrawElementsInstanced) {
 NVN_API(nvnCommandBufferDrawElementsIndirect) {
     *REC(cmd_of(c), OP_DRAW_IDX_IND, p_draw_idx_ind) = (p_draw_idx_ind){(int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4)};
 }
+// Vulkan has native indirect-count draws, so preserve the GPU-written record/count addresses in one replay op.
+// NVN record sizes are 16 bytes for arrays and 20 bytes for elements; a zero stride means tightly packed.
+static int indirect_count_limit(int max, int stride, uint64_t indirect, uint64_t count) {
+    static int logged;
+    if (!logged++)
+        rt_log("DKB-NVN-INDIRECT-COUNT: native Vulkan GPU-count draws (first max=%d stride=%d ind=%#llx count=%#llx)",
+               max, stride, (unsigned long long)indirect, (unsigned long long)count);
+    // Kartnative caps its expanded Metal implementation at the same value. It also bounds a corrupt guest value before
+    // it reaches Vulkan's maxDrawIndirectCount and before the replay computes the argument span.
+    return max > 1024 ? 1024 : max;
+}
+NVN_API(nvnCommandBufferMultiDrawArraysIndirectCount) {
+    int stride = (int)arg_x(c, 5);
+    int max = indirect_count_limit((int)arg_x(c, 4), stride, arg_x(c, 2), arg_x(c, 3));
+    *REC(cmd_of(c), OP_DRAW_IND_COUNT, p_draw_ind_count) =
+        (p_draw_ind_count){(int)arg_x(c, 1), max, stride ? stride : 16, 0, arg_x(c, 2), arg_x(c, 3)};
+}
+NVN_API(nvnCommandBufferMultiDrawElementsIndirectCount) {
+    int stride = (int)arg_x(c, 7);
+    int max = indirect_count_limit((int)arg_x(c, 6), stride, arg_x(c, 4), arg_x(c, 5));
+    *REC(cmd_of(c), OP_DRAW_IDX_IND_COUNT, p_draw_idx_ind_count) =
+        (p_draw_idx_ind_count){(int)arg_x(c, 1), (int)arg_x(c, 2), max, stride ? stride : 20,
+                               arg_x(c, 3), arg_x(c, 4), arg_x(c, 5)};
+}
 // void nvnCommandBufferDispatchCompute(NVNcommandBuffer *cmd, int x, int y, int z): caller = the game's return address
 NVN_API(nvnCommandBufferDispatchCompute) {
     *REC(cmd_of(c), OP_DISPATCH, p_dispatch) = (p_dispatch){(int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), c->x[30]};
@@ -1099,6 +1123,7 @@ const char *nvn_op_name(uint32_t op) {
         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
         "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "PUSH_CONST", "WAIT_SYNC",
+        "DRAW_IND_COUNT", "DRAW_IDX_IND_COUNT",
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";
