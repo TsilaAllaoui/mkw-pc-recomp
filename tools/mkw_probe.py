@@ -80,6 +80,16 @@ def locate(dump: Path) -> tuple[Path, Path | None]:
     ]
     if dump.name.lower() == 'exefs':
         candidates.insert(0, dump.parent)
+    # Also accept a single version-named update folder when 917504 is not present.
+    # Never guess between multiple updates because the generated C is version-sensitive.
+    update_dir = dump / 'updates'
+    if update_dir.is_dir() and not (update_dir / '917504' / 'exefs' / 'main').is_file():
+        alternatives = [p for p in update_dir.iterdir() if p.is_dir() and
+                        (p / 'exefs' / 'main').is_file() and (p / 'exefs' / 'main.npdm').is_file()]
+        if len(alternatives) == 1:
+            candidates.append(alternatives[0])
+        elif len(alternatives) > 1:
+            raise ValueError('Several update folders detected; set MKW_GAME to the exact update folder')
     for root in candidates:
         exefs = root / 'exefs'
         if (exefs / 'main.npdm').is_file() and (exefs / 'main').is_file():

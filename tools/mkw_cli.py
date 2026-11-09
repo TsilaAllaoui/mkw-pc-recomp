@@ -163,7 +163,15 @@ def command(argv: list[str], cwd: Path, dry_run=False) -> None:
 def do_prepare(args):
     repo, exefs, romfs, modules = paths(args)
     if romfs is None or not romfs.is_dir() or not any(romfs.iterdir()):
-        raise ValueError('No non-empty RomFS directory found; an update-only dump must include all required game assets.')
+        # A validated selected packed image is sufficient. Do not force the
+        # user to extract or repack a second full RomFS just to run prepare.
+        selection = repo / 'build' / 'mkw-local' / 'selected-romfs.json'
+        if not selection.is_file():
+            raise ValueError('No extracted RomFS and no selected packed RomFS. Run mkw_select_romfs.py first.')
+        spec = json.loads(selection.read_text(encoding='utf-8'))
+        folder = Path(spec['path'])
+        if spec.get('backend') != 'packed' or not (folder / 'romfs.bin').is_file() or not (folder / 'index.json').is_file():
+            raise ValueError('No non-empty extracted RomFS or valid selected packed image.')
     info = create_lock(exefs, local_hash_path(repo), args.i_confirm_update_180)
     output = {'program_id': EXPECTED_TITLE, 'version_claimed': TARGET_VERSION,
               'update_build_number_claimed': UPDATE_BUILD_NUMBER,
@@ -245,9 +253,9 @@ def chosen_romfs(repo: Path, romfs: Path | None) -> Path:
         folder = Path(spec['path'])
         if not (folder/'index.json').is_file():
             raise ValueError(f'Selected RomFS disappeared: {folder}; rebuild')
-        if spec['backend'] == 'mkw-loose-v1' and not (folder/'loose-root.txt').is_file():
+        if spec['backend'] in ('mkw-loose-v1', 'dkb-loose-v1') and not (folder/'loose-root.txt').is_file():
             raise ValueError(f'Selected loose RomFS root missing: {folder}; rebuild')
-        if spec['backend'] != 'mkw-loose-v1' and not (folder/'romfs.bin').is_file():
+        if spec['backend'] not in ('mkw-loose-v1', 'dkb-loose-v1') and not (folder/'romfs.bin').is_file():
             raise ValueError(f'Selected packed RomFS image missing: {folder}; rebuild')
         return folder
     if romfs and (romfs/'index.json').is_file() and (romfs/'romfs.bin').is_file():

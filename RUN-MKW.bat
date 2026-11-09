@@ -2,10 +2,7 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-if not defined MKW_GAME (
-  echo [ERROR] Set MKW_GAME to the same legally dumped folder used for the build.
-  exit /b 1
-)
+if not defined MKW_GAME set "MKW_GAME=H:\Switch2\Mario_Kart_World_Update_1.8.0"
 if not exist "build\mkw180\dkb.exe" (
   echo [ERROR] No build\mkw180\dkb.exe. Run BUILD-MKW.bat first.
   exit /b 1
