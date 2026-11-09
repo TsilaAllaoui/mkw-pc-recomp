@@ -10,6 +10,8 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include "fp_x86.h"
 #include <immintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include "fp_arm.h"
 #endif
 
 // ---- threads
@@ -51,6 +53,17 @@ int plat_intr_stop(PlatIntr *t, uint64_t *rip, uint64_t *rsp);
 // Lets a stopped t go on: at to when to is nonzero, else where it stopped. 0 when the redirection failed (t then goes
 // on where it stopped).
 int plat_intr_resume(PlatIntr *t, uint64_t to);
+#if defined(__aarch64__)
+// AArch64 has no jump through memory, and code interrupted anywhere may have every general register live, x30 and the
+// IP registers included, so the code a thread was sent to cannot jump back by itself without losing one. It saves the
+// interrupted context here instead (kernel.c kern_ap_stub lays it out) and calls plat_intr_return on the same thread,
+// which makes the OS load all of it, pc and sp included. Does not return.
+typedef struct {
+    uint64_t x[31], sp, pc, nzcv, fpcr, fpsr;
+    __uint128_t q[32];
+} PlatIntrCtx;
+void plat_intr_return(const PlatIntrCtx *c) __attribute__((noreturn));
+#endif
 
 // Fibers: execution contexts with stacks of their own that threads switch between; a fiber may resume on another
 // thread. Each switch keeps the callee-saved registers and the floating-point control state.
@@ -74,6 +87,8 @@ void plat_yield(void);                    // gives the rest of the time slice to
 static inline void plat_pause(void) {     // spin-wait hint
 #if defined(__x86_64__) || defined(_M_X64)
     _mm_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    __asm__ volatile("yield");
 #endif
 }
 
@@ -182,6 +197,10 @@ enum { PLAT_MEM_FREE = -2, PLAT_MEM_RESERVED = -1 };   // plat_mem_state besides
 // Reserves [addr, addr + n) inaccessible, exactly there: 0 when any of it is taken. watch: writes to its pages are
 // tracked for plat_mem_written.
 int plat_mem_reserve(uint64_t addr, uint64_t n, int watch);
+// The lowest range of n bytes at an align boundary inside [lo, hi) that nothing maps yet, reserved at that address
+// (watch as above), *at set to it; 0 when none fits. For a host whose fixed addresses near the guest layout are taken
+// by the system's own mappings, where a reservation at a guessed address would keep failing.
+int plat_mem_reserve_in(uint64_t lo, uint64_t hi, uint64_t n, uint64_t align, int watch, uint64_t *at);
 // n bytes of read-write memory anywhere, zero, backed only as pages are first written (plat_mem_protect may seal them);
 // NULL on failure. Kept until exit.
 void *plat_mem_alloc(size_t n);
@@ -255,7 +274,12 @@ int plat_file_replace(const char *from, const char *to);  // rename, replacing t
 // Writes path.<pid>.<tid>.tmp, flushes it to the disk and renames it over path: a crash leaves the old file or the new
 // one, never a torn or zero-filled one. 1 on success.
 int plat_file_write_atomic(const char *path, const void *data, size_t n);
-int plat_file_flush(const char *path);                   // flushes a written file's data to the disk; 1 on success
+// For cache files that can be derived again (the shader cache): as plat_file_write_atomic and plat_file_replace
+// without the flush to the disk, which costs milliseconds per file. The rename keeps a process crash from leaving a
+// torn file; only a power loss can, and the reader (disk_load_from in gfx_shader.c) rejects it and translates again.
+int plat_file_write_cache(const char *path, const void *data, size_t n);
+int plat_file_replace_cache(const char *from, const char *to);
+int plat_file_flush(const char *path);                  // flushes a written file's data to the disk; 1 on success
 int plat_file_sync(FILE *f);                              // fflush, then the file's data to the disk; 1 on success
 // fseek and ftell with 64-bit offsets (a long is 32 bits on Windows).
 #ifdef _WIN32

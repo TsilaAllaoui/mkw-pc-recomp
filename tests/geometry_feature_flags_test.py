@@ -44,6 +44,9 @@ def fixture(draw):
 static uint8_t geometry_input;
 static int ordinary_enabled, fix_c0, warnings;
 static const uint8_t *original_native_code;
+static int geometry_supported = 1;
+GfxStats gfx_counters;
+int vk_geometry_supported(void) { return geometry_supported; }
 int cfg_bool(const char *name) {
     if(!strcmp(name,"TOTK_NATIVE_GS")){const char *e=getenv("DKB_NATIVE_GS");return e&&*e=='1';}
     if(strcmp(name,"TOTK_EXPERIMENTAL_GEOMETRY"))abort();
@@ -134,6 +137,10 @@ int main(int argc,char **argv) {
     expect(NVN_DRAW_PRIMITIVE_TRIANGLES,native?0:ordinary_enabled?-1:0,"existing native missing-FS fallback");
     setup();original_native_code=codes[1];passthrough();put(controls[1]+0x704,0x80);
     expect(NVN_DRAW_PRIMITIVE_TRIANGLES,native?0:ordinary_enabled?-1:0,"existing native short-code fallback");
+    setup();original_native_code=codes[1];passthrough();geometry_supported=0;
+    expect(NVN_DRAW_PRIMITIVE_TRIANGLES,native?-1:ordinary_enabled?-1:0,"native GS without a device geometry stage");
+    label="geometry stage skip counter";CHECK(gfx_counters.draws_skipped==(native?1u:0u));
+    geometry_supported=1;
     printf("ordinary=%d native=%d: %u checks, %u failures, %d warnings (actual admission only)\n",ordinary_enabled,native,checks,failures,warnings);
     return failures?1:0;
 }

@@ -78,6 +78,14 @@ def pipeline_source():
     prefix += '''
 static void vertex_input(const VkPipeState *s,VtxInput *v) { (void)s;(void)v;abort(); }
 static uint32_t vs_outs(const GfxShader *v,const GfxShader *f,GfxShaderIo io[32]) {(void)v;(void)f;(void)io;abort();}
+// make_module_linked's optional rewrites (screen UV, FMZ, NaN guard, dump, override) are off here: this fixture
+// checks the geometry-chain module path only.
+VkPipelineCreateFlags vk_pipeline_capture_flags(void) {return 0;}
+static int screen_uv_stage(const GfxShader *src) {(void)src;return 0;}
+static uint32_t *spirv_fmz(const uint32_t *w,uint64_t n,int vertex_only,uint64_t *out_n,unsigned *nm,unsigned *nf) {(void)w;(void)n;(void)vertex_only;(void)out_n;(void)nm;(void)nf;return NULL;}
+static uint32_t *nan_guard(const GfxShader *src,const uint32_t *w,uint64_t words,uint64_t *out_n) {(void)src;(void)w;(void)words;(void)out_n;return NULL;}
+static void spv_dump(const uint32_t *w,uint64_t words,const GfxShader *src) {(void)w;(void)words;(void)src;}
+static uint32_t *spv_override(const uint32_t *w,uint64_t words,uint64_t *out_n) {(void)w;(void)words;(void)out_n;return NULL;}
 '''
     names = ['static uint64_t fnv(', 'static VkBlendFactor blend_factor(', 'static VkBlendOp blend_op(',
              'static VkPolygonMode polygon_mode(', 'VkPrimitiveTopology vk_pipeline_topology(',

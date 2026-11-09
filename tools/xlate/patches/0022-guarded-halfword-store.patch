@@ -33,6 +33,7 @@
 +                throw new NotSupportedException("Storage candidates v1 supports aligned 32-bit global operations and the U16 store only.");
              }
 
+ 
              bool storageUnaligned = gpuAccessor.QueryHasUnalignedStorageBuffer();
 @@ -518,7 +520,18 @@
                  Operand words = context.StorageBufferLength(binding);
@@ -51,13 +52,13 @@
 +                {
 +                    inRange = context.BitwiseAnd(inRange, context.ICompareEqual(context.BitwiseAnd(deltaLow, Const(3)), Const(0)));
 +                }
-
+ 
                  Operand skip = Label();
                  context.BranchIfFalse(skip, inRange);
-@@ -1073,6 +1086,35 @@
+@@ -1073,7 +1086,36 @@
                      _ => 32,
                  };
-
+ 
 -                if (bitSize < 32)
 +                if (guarded && bitSize == 16)
 +                {
@@ -91,3 +92,4 @@
 +                else if (bitSize < 32)
                  {
                      Operand bitOffset = HelperFunctionManager.GetBitOffset(context, offset);
+ 

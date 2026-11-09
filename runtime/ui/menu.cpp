@@ -53,6 +53,7 @@ extern const int rt_game_version;
 int romfs_xbox_prompts_ready(void);
 int romfs_xbox_prompts_active(void);
 extern const char rt_port_version[];
+extern const char rt_game_display[];
 }
 
 // Roboto Medium (Apache-2.0, ui/fonts/LICENSE-Roboto.txt) with Latin and Cyrillic glyphs.
@@ -182,6 +183,7 @@ static VkFormat g_vk_fmt;
 static float g_font_scale;        // the scale of the uploaded font atlas; 0 when none is uploaded
 static float g_style_scale;       // the scale the style was last sized for
 static ImGuiStyle g_base_style;   // the menu's style at 1080 lines
+static int g_theme = -1;          // the TOTK_MENU_THEME g_base_style was made for: 1 dk, 0 classic, -1 none yet
 static uint64_t g_last_ns;
 static uint64_t g_cost_ns, g_cost_frames;   // CPU time of layout and recording while open, logged per 600 frames
 
@@ -193,8 +195,44 @@ static float menu_scale(uint32_t h) {
     return ((float)h >= least ? (float)h : least) / 1080.0f;
 }
 
-// SavageWindRecomp's colours: dark green panels, gold accents.
-static void style_init(ImGuiStyle &s) {
+// TOTK_MENU_THEME: "classic" the SavageWindRecomp colours (dark green panels, gold accents), anything else the Donkey Kong
+// look (dk): jungle-bark panels with a lighter bark border, banana yellow for headings and the cursor, cream text, the
+// DK tie's red for the tab underline and the header strip. The rows' own colours are option_rows.cpp's palettes.
+static ImVec4 rgb(int r, int g, int b, float a = 1) { return ImVec4(r / 255.0f, g / 255.0f, b / 255.0f, a); }
+
+static void style_dk(ImGuiStyle &s) {
+    s.WindowRounding = 10; s.PopupRounding = 10; s.FrameRounding = 6; s.GrabRounding = 6; s.TabRounding = 6;
+    s.ChildRounding = 8; s.ScrollbarRounding = 8;
+    s.WindowBorderSize = 2; s.PopupBorderSize = 2; s.FrameBorderSize = 1;
+    ImVec4 *c = s.Colors;
+    ImVec4 banana = rgb(246, 197, 43), bark = rgb(107, 74, 42);
+    c[ImGuiCol_WindowBg] = rgb(42, 26, 14, 0.96f);
+    c[ImGuiCol_PopupBg] = rgb(42, 26, 14, 0.98f);
+    c[ImGuiCol_Border] = bark;
+    c[ImGuiCol_Text] = rgb(243, 233, 210);
+    c[ImGuiCol_TextDisabled] = rgb(190, 168, 138);
+    c[ImGuiCol_FrameBg] = rgb(59, 38, 20);
+    c[ImGuiCol_FrameBgHovered] = rgb(82, 54, 28);
+    c[ImGuiCol_FrameBgActive] = rgb(98, 64, 30);
+    c[ImGuiCol_Button] = rgb(84, 54, 26);
+    c[ImGuiCol_ButtonHovered] = rgb(122, 77, 28);
+    c[ImGuiCol_ButtonActive] = rgb(138, 86, 28);
+    c[ImGuiCol_Tab] = rgb(59, 38, 20);
+    c[ImGuiCol_TabHovered] = rgb(122, 77, 28);
+    c[ImGuiCol_TabSelected] = rgb(92, 58, 26);
+    c[ImGuiCol_TabDimmed] = c[ImGuiCol_Tab];
+    c[ImGuiCol_TabDimmedSelected] = c[ImGuiCol_TabSelected];
+    c[ImGuiCol_TabSelectedOverline] = c[ImGuiCol_TabDimmedSelectedOverline] = ImVec4(0, 0, 0, 0);   // layout_menu draws a red underline
+    c[ImGuiCol_NavCursor] = banana;
+    c[ImGuiCol_Separator] = bark;
+    c[ImGuiCol_ScrollbarBg] = rgb(0, 0, 0, 0.25f);
+    c[ImGuiCol_ScrollbarGrab] = rgb(140, 100, 56);
+    c[ImGuiCol_ScrollbarGrabHovered] = rgb(190, 140, 70);
+    c[ImGuiCol_ScrollbarGrabActive] = banana;
+    c[ImGuiCol_ModalWindowDimBg] = rgb(0, 0, 0, 0.55f);
+}
+
+static void style_init(ImGuiStyle &s, bool dk) {
     ImGui::StyleColorsDark(&s);
     s.WindowRounding = 14; s.FrameRounding = 8; s.GrabRounding = 8; s.TabRounding = 8; s.ChildRounding = 10;
     s.WindowPadding = ImVec2(28, 22); s.FramePadding = ImVec2(14, 8); s.ItemSpacing = ImVec2(14, 12);
@@ -214,6 +252,7 @@ static void style_init(ImGuiStyle &s) {
     c[ImGuiCol_TabSelectedOverline] = gold;
     c[ImGuiCol_NavCursor] = gold;
     c[ImGuiCol_Separator] = ImVec4(0.30f, 0.36f, 0.30f, 1);
+    if (dk) style_dk(s);
 }
 
 static void make_context(void) {
@@ -223,7 +262,7 @@ static void make_context(void) {
     io.LogFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     io.BackendPlatformName = "totk_menu";
-    style_init(g_base_style);
+    style_init(g_base_style, true);   // overlay_frame makes it again for the theme in the settings
     ImGui::GetStyle() = g_base_style;
     g_ctx_ok = 1;
 }
@@ -444,7 +483,7 @@ static const int kSizes[][2] = {{1280, 720}, {1366, 768}, {1600, 900}, {1920, 10
 enum { MAX_SIZES = sizeof kSizes / sizeof *kSizes + 1 };
 
 static void row_window_size(void) {
-    if (cfg_bool("TOTK_FULLSCREEN")) opt_disable_next(UI_MENU_WINDOWED_ONLY);
+    if (gfx_cfg_fullscreen()) opt_disable_next(UI_MENU_WINDOWED_ONLY);
     int sz[MAX_SIZES][2], n = 0, mw = 0, mh = 0, cw = 0, ch = 0;
     int have = gfx_window_monitor_size(&mw, &mh);
     int cur_ok = sscanf(cfg_value("TOTK_WINDOW_SIZE"), "%dx%d", &cw, &ch) == 2;
@@ -533,13 +572,15 @@ static void rows_dkb_wide(void) {
 }
 
 static void row_render_scale(void) {
-    static const char *const vals[] = {"game", "50", "67", "75", "100", "125", "150", "200"};
+    static const char *const vals[] = {"game", "50", "59", "67", "75", "77", "100", "125", "150", "200"};
+    // AMD's FSR 1 quality modes; they are brand names, so they stay untranslated
+    static const char *const fsr[] = {"", " (Performance)", " (Balanced)", " (Quality)", "", " (Ultra quality)"};
     enum { N = sizeof vals / sizeof *vals };
-    char shown[N][32];
+    char shown[N][40];
     const char *names[N];
     names[0] = menu_text(UI_MENU_RENDER_SCALE_GAME);
     for (int i = 1; i < N; i++) {
-        snprintf(shown[i], sizeof shown[i], "%s %%", vals[i]);
+        snprintf(shown[i], sizeof shown[i], "%s %%%s", vals[i], i < 6 ? fsr[i] : "");
         names[i] = shown[i];
     }
     opt_choice_list("TOTK_RENDER_SCALE", UI_MENU_RENDER_SCALE, vals, names, N, UI_MENU_RENDER_SCALE_DESC);
@@ -652,9 +693,19 @@ static void rows_color(void) {
     }
 }
 
+// TOTK_FULLSCREEN follows the row, so the older key and the profiles that set it stay true to the window.
+static void row_window_mode(void) {
+    static const char *const vals[] = {"windowed", "borderless", "fullscreen"};
+    const char *names[] = {menu_text(UI_MENU_WINDOW_MODE_WINDOWED), menu_text(UI_MENU_WINDOW_MODE_BORDERLESS),
+                           menu_text(UI_MENU_WINDOW_MODE_FULLSCREEN)};
+    if (opt_choice_list("TOTK_WINDOW_MODE", UI_MENU_WINDOW_MODE, vals, names, 3, UI_MENU_WINDOW_MODE_DESC,
+                        gfx_cfg_window_mode()))
+        cfg_set("TOTK_FULLSCREEN", gfx_cfg_window_mode() ? "1" : "0");   // the save is already scheduled
+}
+
 static void tab_screen(float scale) {
     opt_begin("##screen", scale);
-    opt_toggle("TOTK_FULLSCREEN", UI_MENU_FULLSCREEN, UI_MENU_FULLSCREEN_DESC);
+    row_window_mode();
     row_output_res();
     if (!rt_game_version) rows_dkb_wide();
     else row_window_size();
@@ -668,6 +719,8 @@ static void tab_screen(float scale) {
     static const UiTextId up[] = {UI_MENU_UPSCALER_FSR, UI_MENU_UPSCALER_BILINEAR};
     opt_choice("TOTK_UPSCALER", UI_MENU_UPSCALER, up, 2, UI_MENU_UPSCALER_DESC);
     opt_slider("TOTK_SHARPNESS", UI_MENU_SHARPNESS, 0, 100, UI_MENU_SHARPNESS_DESC, 5, "%.0f %%");
+    static const UiTextId smaa[] = {UI_MENU_OFF, UI_MENU_SMAA_LOW, UI_MENU_SMAA_MEDIUM, UI_MENU_SMAA_HIGH};
+    opt_choice("TOTK_SMAA", UI_MENU_SMAA, smaa, 4, UI_MENU_SMAA_DESC);
     static const UiTextId aspect[] = {UI_MENU_ASPECT_FIT, UI_MENU_ASPECT_STRETCH};
     opt_choice("TOTK_ASPECT", UI_MENU_ASPECT, aspect, 2, UI_MENU_ASPECT_DESC);
     opt_slider("TOTK_FOV", UI_MENU_FOV, 70, 140, UI_MENU_FOV_DESC, 5, "%.0f %%");
@@ -692,6 +745,8 @@ static void tab_game(float scale) {
 static void tab_sound(float scale) {
     opt_begin("##sound", scale);
     opt_slider("TOTK_VOLUME", UI_MENU_VOLUME, 0, 100, UI_MENU_VOLUME_DESC, 5, "%.0f %%");
+    static const UiTextId channels[] = {UI_MENU_CHANNELS_AUTO, UI_MENU_CHANNELS_STEREO, UI_MENU_CHANNELS_51};
+    opt_choice("TOTK_AUDIO_CHANNELS", UI_MENU_AUDIO_CHANNELS, channels, 3, UI_MENU_AUDIO_CHANNELS_DESC);
     opt_end();
 }
 
@@ -732,6 +787,8 @@ static void tab_menu(float scale) {
     opt_begin("##menu", scale);
     static const UiTextId langs[] = {UI_MENU_MENU_LANG_AUTO, UI_MENU_LANGNAME_EN, UI_MENU_LANGNAME_RU};
     opt_choice("TOTK_MENU_LANG", UI_MENU_MENU_LANG, langs, 3, UI_MENU_MENU_LANG_DESC);
+    static const UiTextId themes[] = {UI_MENU_THEME_DK, UI_MENU_THEME_CLASSIC};
+    opt_choice("TOTK_MENU_THEME", UI_MENU_THEME, themes, 2, UI_MENU_THEME_DESC);
     opt_end();
 }
 
@@ -894,6 +951,69 @@ static void tab_advanced(float scale) {
     }
 }
 
+// A hand of bananas drawn from crescents (quads along a curved centre line): three fanned out from a brown stem at
+// stem, about 1.7 s wide.
+static void draw_bananas(ImDrawList *dl, ImVec2 stem, float s) {
+    const int N = 14;
+    const float R = 0.95f * s, wmax = 0.34f * s, pi = 3.14159265f;
+    const ImU32 cols[3] = {IM_COL32(222, 165, 30, 255), IM_COL32(255, 214, 80, 255), IM_COL32(246, 197, 43, 255)};
+    const int order[3] = {0, 2, 1};   // the middle one on top
+    for (int k = 0; k < 3; k++) {
+        int b = order[k];
+        float rot = (b - 1) * 0.5f, cr = cosf(rot), sr = sinf(rot);
+        ImVec2 outer[N + 1], inner[N + 1];
+        for (int i = 0; i <= N; i++) {
+            float t = (float)i / N, a = pi - t * 1.45f, wd = wmax * (0.2f + 0.8f * sinf(pi * (0.1f + 0.8f * t)));
+            float dx = cosf(a), dy = sinf(a), px = R + R * dx, py = R * dy;
+            float ox = px + dx * wd * 0.5f, oy = py + dy * wd * 0.5f, ix = px - dx * wd * 0.5f, iy = py - dy * wd * 0.5f;
+            outer[i] = ImVec2(stem.x + ox * cr - oy * sr, stem.y + ox * sr + oy * cr);
+            inner[i] = ImVec2(stem.x + ix * cr - iy * sr, stem.y + ix * sr + iy * cr);
+        }
+        for (int i = 0; i < N; i++) {
+            ImVec2 q[4] = {outer[i], outer[i + 1], inner[i + 1], inner[i]};
+            dl->AddConvexPolyFilled(q, 4, cols[b]);
+        }
+        ImVec2 tip((outer[N].x + inner[N].x) * 0.5f, (outer[N].y + inner[N].y) * 0.5f);
+        dl->AddCircleFilled(tip, wmax * 0.2f, IM_COL32(74, 47, 24, 255));
+    }
+    dl->AddRectFilled(ImVec2(stem.x - 0.12f * s, stem.y - 0.2f * s), ImVec2(stem.x + 0.12f * s, stem.y + 0.06f * s),
+                      IM_COL32(92, 58, 26, 255), 0.05f * s);
+}
+
+// Text drawn bold (twice, a pixel apart) and letter-spaced, with a drop shadow; ASCII and two-byte characters only.
+static float draw_display(ImDrawList *dl, ImVec2 pos, float size, ImU32 col, const char *text, float space, float px) {
+    ImFont *font = ImGui::GetFont();
+    float x = pos.x;
+    for (const char *p = text; *p;) {
+        int n = ((unsigned char)*p & 0xE0) == 0xC0 ? 2 : 1;
+        char ch[3] = {p[0], n == 2 ? p[1] : '\0', 0};
+        dl->AddText(font, size, ImVec2(x + px * 2, pos.y + px * 2), IM_COL32(0, 0, 0, 150), ch);
+        dl->AddText(font, size, ImVec2(x, pos.y), col, ch);
+        dl->AddText(font, size, ImVec2(x + px, pos.y), col, ch);
+        x += font->CalcTextSizeA(size, FLT_MAX, 0, ch).x + space;
+        p += n;
+    }
+    return x - pos.x;
+}
+
+// The dk theme's title strip: dark bark with the DK tie's red under it, the bananas, the game and port name in a bold
+// display look (Roboto Medium, thickened and spaced) and the version at the right.
+static void header_dk(float scale, const char *version) {
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x, fs = ImGui::GetFontSize(), hh = fs * 2.0f, tie = 4 * scale;
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + hh), IM_COL32(200, 40, 30, 255), 8 * scale);
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + hh - tie), IM_COL32(26, 15, 8, 255), 8 * scale, ImDrawFlags_RoundCornersTop);
+    draw_bananas(dl, ImVec2(p.x + hh * 0.5f, p.y + hh * 0.14f), hh * 0.82f);
+    float size = fs * 1.2f, tx = p.x + hh * 2.0f, ty = p.y + (hh - tie - size) * 0.5f;
+    draw_display(dl, ImVec2(tx, ty), size, IM_COL32(246, 197, 43, 255), "DONKEY KONG BANANZA  \xC2\xB7  PC RECOMP", 2.5f * scale,
+                 1.2f * scale);
+    float vw = ImGui::CalcTextSize(version).x;
+    dl->AddText(ImVec2(p.x + w - vw - 14 * scale, p.y + (hh - tie - fs) * 0.5f), ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                version);
+    ImGui::Dummy(ImVec2(w, hh));
+}
+
 static const UiTextId kTabNames[TAB_COUNT] = {UI_MENU_TAB_SCREEN, UI_MENU_TAB_GAME, UI_MENU_TAB_SOUND,
                                               UI_MENU_TAB_CONTROLS, UI_MENU_TAB_MENU, UI_MENU_TAB_ADVANCED};
 static int g_tab;               // the tab shown
@@ -909,13 +1029,16 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     ImGui::SetNextWindowSize(ImVec2(ww, wh), ImGuiCond_Always);
     ImGui::Begin("##menu", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
                                         ImGuiWindowFlags_NoSavedSettings);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", menu_text(UI_MENU_TITLE));
     // the port version and the game update, right-aligned on the title line: what a bug report needs first
-    char game[16], version[96];
-    snprintf(game, sizeof game, "%d.%d.%d", rt_game_version / 100, rt_game_version / 10 % 10, rt_game_version % 10);
-    snprintf(version, sizeof version, menu_text(UI_MENU_VERSION), rt_port_version, game);
-    ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x);
-    ImGui::TextDisabled("%s", version);
+    char version[96];
+    snprintf(version, sizeof version, menu_text(UI_MENU_VERSION), rt_port_version, rt_game_display);
+    if (g_theme == 1) {
+        header_dk(scale, version);
+    } else {
+        ImGui::TextColored(opt_accent(), "%s", menu_text(UI_MENU_TITLE));
+        ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - ImGui::CalcTextSize(version).x);
+        ImGui::TextDisabled("%s", version);
+    }
 
     int step = g_modal || binds_modal()                                                                  ? 0
              : ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || ImGui::IsKeyPressed(ImGuiKey_E, false) ? 1
@@ -932,6 +1055,12 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
             snprintf(label, sizeof label, "  %s  ###tab%d", menu_text(kTabNames[k]), k);   // the id stays per language
             if (!ImGui::BeginTabItem(label, nullptr, g_tab_request == k ? ImGuiTabItemFlags_SetSelected : 0)) continue;
             g_tab = k;
+            if (g_theme == 1) {   // the DK tie's red under the selected tab
+                ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+                ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(a.x + 6 * scale, b.y - 5 * scale),
+                                                          ImVec2(b.x - 6 * scale, b.y - 1 * scale), IM_COL32(200, 40, 30, 255),
+                                                          2 * scale);
+            }
             if (g_focus_page == k) {
                 opt_focus_first();
                 g_focus_page = -1;
@@ -960,7 +1089,7 @@ static void layout_menu(uint32_t w, uint32_t h, float scale) {
     float y = ImGui::GetCursorPosY();
     if (!cfg_last_save_ok()) {   // stays until a save succeeds; the settings hold for the session
         ImGui::SetCursorPosY(y + st.FramePadding.y);
-        ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1), "%s", menu_text(UI_MENU_SAVE_FAILED));
+        ImGui::TextColored(g_theme == 1 ? opt_warn() : ImVec4(0.95f, 0.45f, 0.35f, 1), "%s", menu_text(UI_MENU_SAVE_FAILED));
     }
     const char *cont = menu_text(UI_MENU_CONTINUE), *quit = menu_text(UI_MENU_QUIT);
     float bw = fmaxf(ImGui::CalcTextSize(cont).x, ImGui::CalcTextSize(quit).x) + st.FramePadding.x * 4;
@@ -1252,6 +1381,13 @@ extern "C" int menu_overlay_frame(uint64_t frame, const MenuTarget *t, const cha
         g_failed.store(1);
         set_open(0);
         return 0;
+    }
+    int dk = strcmp(cfg_value("TOTK_MENU_THEME"), "classic") != 0;   // live: the next frame has the new look
+    if (dk != g_theme) {
+        style_init(g_base_style, dk);
+        opt_theme(dk);
+        g_theme = dk;
+        g_style_scale = 0;
     }
     if (g_style_scale != scale) {
         ImGui::GetStyle() = g_base_style;

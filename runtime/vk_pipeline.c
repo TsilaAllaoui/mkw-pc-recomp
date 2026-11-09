@@ -51,6 +51,8 @@
 #include "host.h"
 #include "nvn_hmap.h"
 #include "platform/platform.h"
+#include "spirv_nan_guard.h"
+#include "spirv_screen_uv.h"
 #include "tex.h"
 
 #define LOG_ONCE(...) do { static volatile int32_t once_; if (!plat_xchg32(&once_, 1)) rt_log(__VA_ARGS__); } while (0)
@@ -73,6 +75,7 @@ static struct {
     VkDevice device;
     VkPipelineCache cache;
     uint32_t max_push;
+    uint32_t max_stage_samplers;       // maxPerStageDescriptorSamplers: a push set stays within it (push_fits)
     int indep;                         // stage-independent layouts (vk_caps.gpl): vertex set 0, fragment set 1
     int push_stage;                    // GFX_STAGE_* whose set is pushed with independent layouts
     int gpl;                           // draws whose pipeline is building get a fast-linked one (vk_caps.gpl)
@@ -213,6 +216,7 @@ static int ensure_init(void) {
     VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pd};
     vkGetPhysicalDeviceProperties2(c->phys, &p2);
     P.max_push = pd.maxPushDescriptors;
+    P.max_stage_samplers = p2.properties.limits.maxPerStageDescriptorSamplers;
     P.indep = vk_caps.gpl;
     P.gpl = vk_caps.gpl;
     rt_log(P.gpl ? "vk_pipeline: graphics pipeline library on: a draw whose pipeline is building gets a fast-linked one, "
@@ -318,9 +322,9 @@ static int ensure_init(void) {
     if (P.dyn_wmask) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT;
     if (P.dyn_a2c) P.dyn[P.n_dyn++] = VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT;
     cache_load(c);
-    rt_log("vk_pipeline: max push descriptors %u; dynamic vertex input %d, depth clamp %d, polygon mode %d, blend enable %d, "
+    rt_log("vk_pipeline: max push descriptors %u, samplers per stage %u; dynamic vertex input %d, depth clamp %d, polygon mode %d, blend enable %d, "
            "blend equation %d, write mask %d, alpha to coverage %d; cache %s",
-           P.max_push, P.dyn_vi, P.dyn_clamp, P.dyn_poly, P.dyn_blend_en, P.dyn_blend_eq, P.dyn_wmask, P.dyn_a2c,
+           P.max_push, P.max_stage_samplers, P.dyn_vi, P.dyn_clamp, P.dyn_poly, P.dyn_blend_en, P.dyn_blend_eq, P.dyn_wmask, P.dyn_a2c,
            P.cache_path[0] ? P.cache_path : "<memory only>");
     keys_open();
     plat_xchg32(&P.ready, 1);
@@ -394,6 +398,8 @@ VkPrimitiveTopology vk_pipeline_topology(int prim) {
     default: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;   // TRIANGLES; QUADS after the replay's index rewrite
     }
 }
+
+int vk_geometry_supported(void) { return P.f_geometry; }
 
 // Topology class (a pipeline's static topology only fixes the class): 0 point, 1 line, 2 triangle, 3 patch.
 uint8_t vk_geometry_input(uint32_t primitive) {
@@ -1216,18 +1222,103 @@ static uint32_t *spirv_fmz(const uint32_t *w, uint64_t n, int vertex_only, uint6
     return o;
 }
 
+// Fragment stages whose screen-position varyings are rebuilt from gl_FragCoord (spirv_screen_uv.c): Bananza's map
+// mask, which AMD's near-plane clipping turns into long wedges (Eglantine too). Named by NVN 2 stage origin, which
+// gfx_shader.c keeps per input id in shader-cache/nvn2-origins.bin, so the pipelines the boot prewarm builds from the
+// cache know it once the stage was lowered in any run (--translate-shaders or play). Until then the FNV-1a 64 of the
+// translated SPIR-V (the "fs" hash of a TOTK_DUMP passes.txt) names it on the hosts where it was measured.
+// TOTK_FIX_SCREEN_UV=0 leaves them as the game wrote them.
+static int screen_uv_stage(const GfxShader *src) {
+    static const uint64_t origins[] = {0x81f30a4006e64d83ull};
+    static const uint64_t spirv_hashes[] = {0x544677ae4ec509beull};   // RX 9070 XT, translator d1b11706005e89ab
+    static int on = -1;
+    if (on < 0) on = cfg_bool("TOTK_FIX_SCREEN_UV");
+    if (!on || !src || gfx_shader_stage(src) != GFX_STAGE_FS) return 0;
+    uint64_t o = gfx_shader_origin(src);
+    for (size_t i = 0; i < sizeof origins / sizeof *origins; i++)
+        if (o == origins[i]) return 1;
+    uint64_t h = gfx_shader_spirv_fnv(src);
+    for (size_t i = 0; i < sizeof spirv_hashes / sizeof *spirv_hashes; i++)
+        if (h == spirv_hashes[i]) return 1;
+    return 0;
+}
+
+// DKB_NAN_GUARD (spirv_nan_guard.c): fragment stages store 0 instead of NaN to their float colour outputs (default,
+// or "zero"), a colour named by the stage instead ("mark"), or what they computed ("0"). One NaN texel in the scene
+// colour is spread by the bloom into a glowing band crossed by black lines, and the console shows none. In "mark"
+// mode the colour comes from the stage's SPIR-V hash (the "fs" hash of a TOTK_DUMP passes.txt): each of r, g, b is
+// 0, 1, 4 or 16 from two bits of the hash, so a frame dump's _tm image tells the stage apart from the others drawn in
+// the pass, and the log lists each stage with its colour.
+static uint32_t *nan_guard(const GfxShader *src, const uint32_t *w, uint64_t words, uint64_t *out_n) {
+    static int mode_set = -1;   // 0 off, 1 zero, 2 mark; read and written atomically
+    static volatile int32_t logged;
+    int mode = __atomic_load_n(&mode_set, __ATOMIC_RELAXED);
+    if (mode < 0) {   // every racing thread computes the same value; only the first logs it
+        const char *e = cfg_get("TOTK_NAN_GUARD");
+        int m = !e || !strcmp(e, "1") || !strcmp(e, "zero") ? 1 : !strcmp(e, "0") || !*e ? 0 : !strcmp(e, "mark") ? 2 : 1;
+        if (!plat_xchg32(&logged, 1)) {
+            if (e && *e && strcmp(e, "0") && strcmp(e, "1") && strcmp(e, "zero") && strcmp(e, "mark"))
+                rt_log("vk: DKB_NAN_GUARD=%s ignored, using zero (use 0, zero or mark)", e);
+            rt_log("vk: NaN guard on fragment outputs: %s", m == 2 ? "mark" : m ? "zero" : "off");
+        }
+        __atomic_store_n(&mode_set, m, __ATOMIC_RELAXED);
+        mode = m;
+    }
+    if (!mode || !src || gfx_shader_stage(src) != GFX_STAGE_FS) return NULL;
+    static const float level[4] = {0.0f, 1.0f, 4.0f, 16.0f};
+    uint64_t h = mode == 2 ? gfx_shader_spirv_fnv(src) : 0;
+    float marker[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (mode == 2) {
+        marker[0] = level[h & 3], marker[1] = level[h >> 2 & 3], marker[2] = level[h >> 4 & 3], marker[3] = 1.0f;
+        if (!(h & 0x3f)) marker[0] = 16.0f;   // never black: black is what the zero mode writes
+    }
+    unsigned stores = 0;
+    uint32_t *o = spirv_nan_guard(w, words, marker, out_n, &stores);
+    if (o && mode == 2)
+        rt_log("vk: fs %016llx: NaN marked as %g %g %g (%u stores)", (unsigned long long)h, marker[0], marker[1],
+               marker[2], stores);
+    return o;
+}
+
 static VkShaderModule make_module_linked(const GfxShader *src, const uint32_t *w, uint64_t words, int geometry_chain) {
     uint64_t fixed_n = 0;
     uint32_t *fixed = geometry_chain ? spirv_fixup_linked(w, words, &fixed_n, 1) : spirv_fixup(w, words, &fixed_n);
     if (fixed) w = fixed, words = fixed_n;
+    uint32_t *suv = NULL;
+    if (screen_uv_stage(src)) {
+        uint64_t suv_n = 0;
+        suv = spirv_screen_uv(w, words, &suv_n);
+        if (suv) w = suv, words = suv_n;
+        rt_log("vk: fs %016llx (origin %016llx): screen position %s", (unsigned long long)gfx_shader_spirv_fnv(src),
+               (unsigned long long)gfx_shader_origin(src),
+               suv ? "rebuilt from gl_FragCoord" : "left as written (unexpected layout)");
+    }
     static int fmz_mode = -1;   // 0 off, 1 vertex stage only, 2 every stage
     if (fmz_mode < 0) {
         const char *e = cfg_get("TOTK_FMZ");
-        fmz_mode = !e || !strcmp(e, "0") || !*e ? 0 : !strcmp(e, "vertex") ? 1 : !strcmp(e, "all") ? 2 : 0;
-        if (e && *e && !fmz_mode && strcmp(e, "0")) rt_log("vk: DKB_FMZ=%s ignored (use vertex or all)", e);
+        // On by default for vertex stages (#75): the end-of-tutorial cutscene loses the NVIDIA device without it.
+        fmz_mode = !e ? 1 : !strcmp(e, "0") || !*e ? 0 : !strcmp(e, "vertex") ? 1 : !strcmp(e, "all") ? 2 : 1;
+        if (e && *e && strcmp(e, "0") && strcmp(e, "vertex") && strcmp(e, "all")) rt_log("vk: DKB_FMZ=%s ignored, using vertex (use 0, vertex or all)", e);
+    }
+    // DKB_FMZ_SEL=<mask>:<value> (hex, bisection aid for #75): only modules whose FNV-1a 64 hash before the rewrite
+    // satisfies (hash & mask) == value get the FMZ rewrite, so a run can cover a fixed half, quarter, ... of them.
+    static uint64_t fmz_sel_mask, fmz_sel_val;
+    static int fmz_sel_read;
+    if (!fmz_sel_read) {
+        fmz_sel_read = 1;
+        const char *s = cfg_get("TOTK_FMZ_SEL");
+        char *end;
+        if (s && *s) {
+            fmz_sel_mask = strtoull(s, &end, 16);
+            if (*end == ':') fmz_sel_val = strtoull(end + 1, NULL, 16) & fmz_sel_mask;
+            else fmz_sel_mask = 0;
+        }
     }
     uint32_t *fmz = NULL;
-    if (fmz_mode) {
+    uint64_t pre_h = 0xcbf29ce484222325ull;
+    if (fmz_mode && fmz_sel_mask)
+        for (uint64_t i = 0; i < words * 4; i++) pre_h = (pre_h ^ ((const uint8_t *)w)[i]) * 0x100000001b3ull;
+    if (fmz_mode && (!fmz_sel_mask || (pre_h & fmz_sel_mask) == fmz_sel_val)) {
         uint64_t fmz_n = 0;
         unsigned nm = 0, nf = 0;
         fmz = spirv_fmz(w, words, fmz_mode == 1, &fmz_n, &nm, &nf);
@@ -1238,6 +1329,8 @@ static VkShaderModule make_module_linked(const GfxShader *src, const uint32_t *w
             rt_log("vk: FMZ rewrite %016llx mul=%u fma=%u", (unsigned long long)h, nm, nf);
         }
     }
+    uint32_t *nan = nan_guard(src, w, words, &words);
+    if (nan) w = nan;
     spv_dump(w, words, src);
     uint64_t ov_n = 0;
     uint32_t *ov = spv_override(w, words, &ov_n);
@@ -1246,7 +1339,9 @@ static VkShaderModule make_module_linked(const GfxShader *src, const uint32_t *w
     VkShaderModule m = VK_NULL_HANDLE;
     VkResult r = vkCreateShaderModule(P.device, &ci, NULL, &m);
     free(ov);
+    free(nan);
     free(fmz);
+    free(suv);
     free(fixed);
     return r == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
@@ -1604,7 +1699,8 @@ static const char *geometry_validate(const VkPipeState *s, const VkPhysicalDevic
     if (!s->vs || !s->gs || gfx_shader_stage(s->vs) != GFX_STAGE_VS ||
         (s->fs && gfx_shader_stage(s->fs) != GFX_STAGE_FS)) return "geometry shader stage mismatch";
     const GfxShaderGeometry *g = gfx_shader_geometry(s->gs);
-    if (!P.f_geometry || !g ||
+    if (!P.f_geometry) return "device has no geometryShader";
+    if (!g ||
         (g->version != GFX_GEOMETRY_VERSION && g->version != GFX_GEOMETRY_PASSTHROUGH_VERSION) || g->passthrough ||
         !vk_geometry_input(s->prim) || vk_geometry_input(s->prim) != g->input ||
         g->input_vertices != input_vertices[g->input] || g->output < GFX_GEOMETRY_OUTPUT_POINTS ||
@@ -1828,6 +1924,30 @@ static int64_t bindings_sort(Bindings *B, uint64_t *h) {
     return total;
 }
 
+// Whether a set of n bindings holding total descriptors may be a push-descriptor set: it fits maxPushDescriptors and
+// no stage samples through more samplers than maxPerStageDescriptorSamplers. MoltenVK binds a push set slot by slot,
+// and Metal has 16 sampler slots per stage ([[sampler(0..15)]]): a Bananza G-buffer fragment shader with more failed
+// to compile and its draws were skipped. An ordinary set goes through Metal argument buffers there, which have no such
+// slots. Other drivers report thousands of samplers per stage, so their sets stay as they were.
+static int push_fits(const VkDescriptorSetLayoutBinding *b, uint32_t n, int64_t total) {
+    if (total > (int64_t)P.max_push) return 0;
+    static const VkShaderStageFlags st[] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
+                                            VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
+    for (unsigned s = 0; s < sizeof st / sizeof *st; s++) {
+        uint64_t k = 0;
+        for (uint32_t i = 0; i < n; i++)
+            if ((b[i].stageFlags & st[s]) && (b[i].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+                                              b[i].descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER))
+                k += b[i].descriptorCount;
+        if (k > P.max_stage_samplers) {
+            LOG_ONCE("vk_pipeline: a stage samples through more than %u samplers: its bindings go in an ordinary "
+                     "descriptor set instead of a push set (logged once)", P.max_stage_samplers);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static Layout *layout_get(Bindings *B) {
     uint64_t h = FNV0;
     int64_t total = bindings_sort(B, &h);
@@ -1839,7 +1959,7 @@ static Layout *layout_get(Bindings *B) {
     if (!l) return NULL;
     l->hash = h, l->n = B->n;
     memcpy(l->b, B->b, B->n * sizeof *B->b);
-    l->push = total <= (int64_t)P.max_push;
+    l->push = push_fits(l->b, l->n, total);
     VkDescriptorSetLayoutCreateInfo si = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                           .flags = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
                                           .bindingCount = l->n, .pBindings = l->b};
@@ -1885,8 +2005,8 @@ static Layout *layout_pair(Bindings *B, Bindings *F) {
     if (!l) return NULL;
     l->hash = h, l->n = n, l->n0 = n0;
     memcpy(l->b, B->b, n * sizeof *B->b);
-    l->push = P.push_stage == GFX_STAGE_VS && tv <= (int64_t)P.max_push;
-    l->push1 = P.push_stage == GFX_STAGE_FS && F->n && tf <= (int64_t)P.max_push;
+    l->push = P.push_stage == GFX_STAGE_VS && push_fits(l->b, n0, tv);
+    l->push1 = P.push_stage == GFX_STAGE_FS && F->n && push_fits(l->b + n0, n - n0, tf);
     VkDescriptorSetLayoutCreateInfo s0 = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                                           .flags = l->push ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR : 0,
                                           .bindingCount = n0, .pBindings = l->b};

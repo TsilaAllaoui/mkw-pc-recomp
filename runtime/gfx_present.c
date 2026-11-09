@@ -40,6 +40,7 @@ void vk_queue_unlock(void) { plat_rmutex_unlock(&g_ql); }
 // ---- window state shared with the back end
 static VkSurfaceKHR g_surface;
 static volatile int32_t g_dirty;               // the window was resized; swapchain stale
+static volatile int32_t g_closed;              // gfx_window_closed: exit in progress, present and start drop out
 static volatile int32_t g_focused = 1;
 static volatile int32_t g_focus_msgs;
 static PlatRMutex g_start_lock;       // gfx_window_start / vsync start
@@ -58,17 +59,69 @@ void gfx_window_focus_changed(int in) {
 
 // The window was closed: the process ends with it, as in MNG, once a save Commit still running in the background is
 // done.
-void gfx_window_closed(void) {
-    rt_log("gfx: window closed; exiting");
-    fs_save_flush();
-    vk_pipeline_save();
-    prof_write();   // plat_exit runs no atexit handlers
+//
+// Every exit path (this one, the guest's ExitProcess, the --seconds end) calls gfx_exit_release after its saves: the
+// queued present is dropped once the present thread is idle, then the device is released (idle, swapchain and surface
+// destroyed) before the process ends. plat_exit while a present or a swapchain rebuild is running hung some AMD
+// mobile drivers. g_closed keeps the present thread from rebuilding the surface in between. The first caller does the
+// work; a later one parks, because returning would run guest code while the device goes away, and the first caller
+// ends the process.
+static void exit_watchdog(void *arg) {
+    (void)arg;
+    plat_sleep_ms(3000);
     plat_exit(0);
 }
 
-// TOTK_FULLSCREEN=1: borderless window over the monitor. TOTK_WINDOW_SIZE=<w>x<h>: client area of the window (the
-// swapchain follows the window; the game image is scaled to it).
-int gfx_cfg_fullscreen(void) { return cfg_bool("TOTK_FULLSCREEN"); }
+void gfx_exit_release(void) {
+    if (plat_cas32(&g_closed, 1, 0) != 0)
+        for (;;) plat_sleep_ms(1000);
+    // A hung GPU or driver present must not keep the process alive: end it after a grace period regardless.
+    plat_thread_spawn(exit_watchdog, NULL, "exitwd", 0);
+    vk_present_drain();
+    plat_rmutex_lock(&g_start_lock);   // gfx_window_start sets g_started before it takes g_pl; same order as there
+    gfx_window_release_vk();
+    plat_rmutex_unlock(&g_start_lock);
+}
+
+// The window thread must keep pumping messages: on the SDL back end the present thread asks it for the window size,
+// and vk_present_drain waits for that thread. So the exit runs on its own thread and gfx_window_closed returns at once.
+static void exit_main(void *arg) {
+    (void)arg;
+    fs_save_flush();
+    vk_pipeline_save();
+    prof_write();   // plat_exit runs no atexit handlers
+    gfx_exit_release();
+    plat_exit(0);
+}
+
+void gfx_window_closed(void) {
+    static volatile int32_t requested;
+    if (plat_cas32(&requested, 1, 0) != 0) return;
+    rt_log("gfx: window closed; exiting");
+    if (!plat_thread_spawn(exit_main, NULL, "exit", 0)) {
+        // No thread to run the full exit on: save and end the process inline, as before the release step existed.
+        fs_save_flush();
+        vk_pipeline_save();
+        prof_write();
+        plat_exit(0);
+    }
+}
+
+// TOTK_WINDOW_MODE: windowed, borderless (desktop fullscreen), fullscreen (the display's own mode where the back end can
+// ask for it). Unset, TOTK_FULLSCREEN=1 (the older setting, the Steam Deck profile) means borderless.
+// TOTK_WINDOW_SIZE=<w>x<h>: client area of the window (the swapchain follows the window; the game image is scaled to it).
+int gfx_cfg_window_mode(void) {
+    const char *m = cfg_get("TOTK_WINDOW_MODE");
+    if (cfg_from_env("TOTK_FULLSCREEN") && !cfg_from_env("TOTK_WINDOW_MODE")) m = NULL;   // the older variable wins over the ini
+    if (m && *m) {
+        if (!strcmp(m, "borderless")) return 1;
+        if (!strcmp(m, "fullscreen")) return 2;
+        if (!strcmp(m, "windowed")) return 0;
+    }
+    return cfg_bool("TOTK_FULLSCREEN") ? 1 : 0;
+}
+
+int gfx_cfg_fullscreen(void) { return gfx_cfg_window_mode() != 0; }
 
 void gfx_cfg_window_size(int *w, int *h) {
     int x = 0, y = 0;
@@ -259,7 +312,7 @@ const char *gfx_window_present_mode(void) { return __atomic_load_n(&g_present_go
 // Queues the present of a blit vk_present_blit left waiting (g_pl held). A swapchain rebuild and the next blit flush it
 // first; the device release drops it.
 static void flip_locked(void) {
-    if (!g_flip_on) return;
+    if (!g_flip_on || plat_cas32(&g_closed, 0, 0)) return;
     g_flip_on = 0;
     if (!g_sc) return;
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1,
@@ -281,8 +334,7 @@ static void free_capture(void) {
     g_cap_valid = 0;
 }
 
-// Returns 1 with a usable swapchain, 0 when the window has no area (minimised). Called with g_pl held.
-static int create_swapchain(void) {
+static int build_swapchain(void) {
     flip_locked();   // the acquired image goes out before its swapchain is replaced
     VkCtx *c = vk_ctx();
     VkSurfaceCapabilitiesKHR caps;
@@ -347,8 +399,17 @@ static int create_swapchain(void) {
     }
     free_capture();
     vk_queue_unlock();
-    plat_xchg32(&g_dirty, 0);
     return 1;
+}
+
+// Returns 1 with a usable swapchain, 0 when the window has no area (minimised). Called with g_pl held. The stale mark
+// goes before the surface is read: a resize during the build keeps it. The switch to fullscreen at start lands there
+// on the window thread, and the driver does not report the swapchain as out of date.
+static int create_swapchain(void) {
+    plat_xchg32(&g_dirty, 0);
+    if (build_swapchain()) return 1;
+    plat_xchg32(&g_dirty, 1);
+    return 0;
 }
 
 static void sync_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 s0,
@@ -534,10 +595,12 @@ void gfx_fit_rect(int cw, int ch, int dw, int dh, int out[4]) {
 }
 
 static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w, int h, const int crop[4], int defer) {
+    if (plat_cas32(&g_closed, 0, 0)) return;
     int general = layout == VK_IMAGE_LAYOUT_GENERAL;
     gfx_window_start();
     VkCtx *c = vk_ctx();
     plat_rmutex_lock(&g_pl);
+    if (plat_cas32(&g_closed, 0, 0)) { plat_rmutex_unlock(&g_pl); return; }
     flip_locked();
     if (!g_sc || plat_cas32(&g_dirty, 0, 0)) {
         if (!wsys_minimized() && !create_swapchain() && !g_sc) goto out;
@@ -636,6 +699,8 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
             sync_barrier(cb, psrc, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
                          VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0);
     }
+    // SMAA (TOTK_SMAA, vk_smaa.c) on the scaled picture, before the menu overlay; it leaves the image in TRANSFER_DST
+    vk_smaa_record(cb, dst, to);
     // last: the image's layout, and the stage and access of its last write, as each step leaves it
     VkImageLayout last = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     VkPipelineStageFlags2 last_stage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -728,9 +793,11 @@ void vk_present_flip(void) {
 }
 
 void gfx_window_resize(int cw, int chh) {
+    if (plat_cas32(&g_closed, 0, 0)) return;
     gfx_window_start();
     wsys_resize(cw, chh);
     plat_rmutex_lock(&g_pl);
+    if (plat_cas32(&g_closed, 0, 0)) { plat_rmutex_unlock(&g_pl); return; }   // the exit released the surface meanwhile
     create_swapchain();
     plat_rmutex_unlock(&g_pl);
 }
@@ -746,6 +813,7 @@ void gfx_window_release_vk(void) {
         g_flip_on = 0;   // its blit is done (device idle); the swapchain goes away unpresented
         menu_vk_release();
         vk_fsr_release();
+        vk_smaa_release();
         vk_color_release();
         free_capture();
         free_thumbs();
@@ -768,8 +836,9 @@ void gfx_window_release_vk(void) {
 }
 
 void gfx_window_start(void) {
+    if (plat_cas32(&g_closed, 0, 0)) return;   // the surface is gone for good
     plat_rmutex_lock(&g_start_lock);
-    if (!g_started) {
+    if (!g_started && !plat_cas32(&g_closed, 0, 0)) {
         if (!vk_init()) rt_fatal("gfx: no usable Vulkan device (see the vk: lines above)");
         VkCtx *c = vk_ctx();
         static int opened;

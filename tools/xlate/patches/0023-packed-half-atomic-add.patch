@@ -6,13 +6,13 @@
          GlobalMemoryU16, // TODO: Remove this and store type as a field on the Operation class itself.
 +        GlobalMemoryF16x2, // Packed half2 reduction (RED F16x2FtzRn Add), storage candidates only.
      }
-
+ 
      static class StorageKindExtensions
 --- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
 +++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
 @@ -161,6 +161,15 @@
              InstRed op = context.GetOp<InstRed>();
-
+ 
              (Operand addrLow, Operand addrHigh) = Get40BitsAddress(context, new Register(op.SrcA, RegisterType.Gpr), op.E, op.Imm20);
 +
 +            if (context.TranslatorContext.GpuAccessor.QueryStorageBufferRuntimeCandidates() &&
@@ -23,7 +23,7 @@
 +                context.AtomicAdd(StorageKind.GlobalMemoryF16x2, addrLow, addrHigh, GetDest(op.SrcB));
 +                return;
 +            }
-
+ 
              EmitAtomicOp(context, StorageKind.GlobalMemory, (AtomOp)op.RedOp, op.RedSize, addrLow, addrHigh, GetDest(op.SrcB));
          }
 --- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
@@ -36,7 +36,7 @@
 +                   StorageKind.GlobalMemoryU16 or
 +                   StorageKind.GlobalMemoryF16x2;
          }
-
+ 
          private static bool IsSmallInt(StorageKind storageKind)
 @@ -419,7 +420,9 @@
          {
@@ -56,10 +56,10 @@
 +                StorageKind.GlobalMemoryF16x2 => "F16x2",
                  _ => string.Empty,
              });
-
+ 
 @@ -1011,6 +1015,17 @@
              }
-
+ 
              Operand wordOffset = context.ShiftRightU32(offset, Const(2));
 +
 +            if (guarded && storageKind == StorageKind.GlobalMemoryF16x2 && inst == Instruction.AtomicAdd)
@@ -72,17 +72,17 @@
 +                });
 +                return true;
 +            }
-
+ 
              if (inst.IsAtomic())
              {
 @@ -1164,6 +1179,67 @@
              return true;
          }
-
+ 
 +        // Packed half2 add, RED.E.ADD.F16x2.FTZ.RN, on one 32-bit word. Each half is decoded exactly to an f32
 +        // bit pattern (a zero or subnormal half flushes to a signed zero; Inf and NaN keep their class), the two f32
 +        // values are added with one f32 add, and the sum is rounded to half with round-to-nearest-even. A result below
-+        // the half normal range flushes to a signed zero, overflow gives a signed Inf, and NaN gives 0x7E00.
++        // the half normal range flushes to a signed zero, overflow gives a signed Inf, and NaN gives 0x7E00 (not verified on NVIDIA hardware).
 +        // Only integer selects and one f32 add are emitted, so the sum is exact for the f16 inputs: the f32 add rounds
 +        // the exact sum once, and rounding that to 11 bits again is innocuous for addition (24 >= 2 * 11 + 2).
 +        private static Operand PackedHalfAddFtzRn(EmitterContext context, Operand word, Operand addend)

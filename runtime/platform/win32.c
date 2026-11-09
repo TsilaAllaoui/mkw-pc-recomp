@@ -434,6 +434,28 @@ int plat_file_write_atomic(const char *path, const void *data, size_t n) {
     return 0;
 }
 
+// See platform.h: replace and write_atomic for re-derivable cache files, without the flush to the disk.
+int plat_file_replace_cache(const char *from, const char *to) {
+    wchar_t a[WPATH], b[WPATH];
+    if (!widen(from, a, WPATH) || !widen(to, b, WPATH)) return 0;
+    return MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING) != 0;
+}
+
+int plat_file_write_cache(const char *path, const void *data, size_t n) {
+    char tmp[WPATH + 48];
+    wchar_t a[WPATH], b[WPATH];
+    int len = snprintf(tmp, sizeof tmp, "%s.%u.%u.tmp", path, (unsigned)GetCurrentProcessId(), (unsigned)GetCurrentThreadId());
+    if (len < 0 || len >= (int)sizeof tmp || !widen(tmp, a, WPATH) || !widen(path, b, WPATH)) return 0;
+    HANDLE h = CreateFileW(a, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    DWORD put = 0;
+    int ok = WriteFile(h, data, (DWORD)n, &put, NULL) && put == n;
+    CloseHandle(h);
+    if (ok && MoveFileExW(a, b, MOVEFILE_REPLACE_EXISTING)) return 1;
+    DeleteFileW(a);
+    return 0;
+}
+
 int plat_file_flush(const char *path) {
     wchar_t w[WPATH];
     if (!widen(path, w, WPATH)) return 0;
@@ -502,6 +524,20 @@ int plat_mem_reserve(uint64_t addr, uint64_t n, int watch) {
         p = NULL;
     }
     return p != NULL;
+}
+
+// A linear scan from lo: an address is free when the fixed reservation there succeeds, so a candidate another thread
+// holds costs one failed VirtualAlloc and the scan moves past it.
+int plat_mem_reserve_in(uint64_t lo, uint64_t hi, uint64_t n, uint64_t align, int watch, uint64_t *at) {
+    if (!n || hi <= lo || n > hi - lo) return 0;
+    if (!align) align = 4096;
+    if (align & (align - 1)) return 0;
+    for (uint64_t a = (lo + align - 1) & ~(align - 1); a <= hi - n; a += align)
+        if (plat_mem_reserve(a, n, watch)) {
+            *at = a;
+            return 1;
+        }
+    return 0;
 }
 
 void *plat_mem_alloc(size_t n) { return VirtualAlloc(NULL, n, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE); }

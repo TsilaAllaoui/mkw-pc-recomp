@@ -53,7 +53,7 @@ typedef struct PoolRec {
     uint64_t vmax_gen;                 // POOL_VIRT: the newest of them (vk_mem_vpages_changed skips unchanged pools)
     uint64_t npages;
     volatile int32_t used;                // resolved at least once: the GPU may still read it at finalize
-    volatile uint8_t lazy;                // imported pool deferred until its first GPU use (lazy_import)
+    volatile uint8_t lazy;                // POOL_IMPORT whose import is deferred to the first GPU use (TOTK_POOL_LAZY, lazy_import)
     // TOTK_TRACE=perf dirty census (vk_mem_dirty_submit), replay thread under the submit lock only:
     uint32_t bound_sub;                // last submit that bound it as a buffer (dirty_sub), 0 never
     uint32_t synced_gen;               // page generation its lazy-mirror count covers; DIRTY_UNSYNCED until scanned
@@ -104,8 +104,9 @@ static pidx pool_index;                // POOL_IMPORT, POOL_PHYS and POOL_VIRT r
 static PoolRec **phys_list;            // physical pools by key, for MapVirtual requests
 static int nphys, cap_phys;
 static int32_t n_imports, n_import_failures;
-static PlatMutex lazy_lock = PLAT_MUTEX_INIT;   // NVIDIA serializes these imports; keep one host call in flight
-static volatile int32_t n_lazy_imports;
+static volatile uint64_t import_alloc_ns;   // all vkAllocateMemory calls that imported guest memory (vk_mem_census logs it)
+static PlatMutex lazy_lock = PLAT_MUTEX_INIT;   // one deferred import at a time (the driver serializes them anyway)
+static volatile int32_t n_lazy_imports;         // pools imported on their first GPU use instead of at nvnMemoryPoolInitialize
 static PFN_vkGetMemoryHostPointerPropertiesEXT p_host_props;
 
 static VkBufferUsageFlags pool_usage(const VkCtx *c) {
@@ -138,9 +139,32 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
     r->import_hi = (addr + size + al - 1) & ~(al - 1);
     uint64_t n = r->import_hi - r->import_lo;
     VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-    VkResult res = p_host_props ? p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-                                               (void *)(uintptr_t)r->import_lo, &hp)
-                                : VK_ERROR_EXTENSION_NOT_PRESENT;
+    // The Vulkan spec ties the memory types to the pointer given, but every guest pool here is plain committed
+    // read/write memory (platform/win32.c plat_mem_reserve/plat_mem_commit: no write-combined, uncached or file-view
+    // pages), so the answer is assumed to be the same for all of them. NVIDIA's driver took long in this query for the big guest pools of a level change (five guest threads in turn, 1.8 s in a TOTK_PROFILE_SLOW dump:
+    // the callq before dkb.exe+9331ce7 is this call, handle type 0x80). The first answer is kept for the other pools;
+    // TOTK_HOST_PROPS_CACHE=0 asks every time. A type that would not do fails in vkAllocateMemory below, like before.
+    static volatile uint32_t host_bits;
+    static int cache_on = -1;
+    static int32_t n_slow_props;
+    if (cache_on < 0) {
+        const char *e = cfg_get("TOTK_HOST_PROPS_CACHE");
+        cache_on = !(e && !strcmp(e, "0"));
+    }
+    VkResult res;
+    uint32_t known = cache_on ? __atomic_load_n(&host_bits, __ATOMIC_ACQUIRE) : 0;
+    if (known) {
+        hp.memoryTypeBits = known, res = VK_SUCCESS;
+    } else {
+        uint64_t t0 = qpc();
+        res = p_host_props ? p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                          (void *)(uintptr_t)r->import_lo, &hp)
+                           : VK_ERROR_EXTENSION_NOT_PRESENT;
+        double ms = (double)(qpc() - t0) / 1e6;
+        if (ms > 10.0 && plat_inc32(&n_slow_props) <= 16)
+            rt_log("vk: vkGetMemoryHostPointerPropertiesEXT of %llu MiB took %.1f ms", (unsigned long long)(n >> 20), ms);
+        if (res == VK_SUCCESS && hp.memoryTypeBits && cache_on) __atomic_store_n(&host_bits, hp.memoryTypeBits, __ATOMIC_RELEASE);
+    }
     if (res != VK_SUCCESS || !hp.memoryTypeBits) {
         rt_log("vk: pool %#llx+%#llx: host pointer not importable (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
         return 0;
@@ -170,8 +194,28 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
                                            .pHostPointer = (void *)(uintptr_t)r->import_lo};
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &im, .allocationSize = n,
                                .memoryTypeIndex = (uint32_t)type};
-    if ((res = vkAllocateMemory(c->device, &ai, NULL, &r->mem)) != VK_SUCCESS ||
-        (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS) {
+    static int32_t n_slow_alloc;
+    uint64_t ta = qpc();
+    res = vkAllocateMemory(c->device, &ai, NULL, &r->mem);
+    if (res != VK_SUCCESS && known && p_host_props) {
+        r->mem = VK_NULL_HANDLE;
+        VkMemoryHostPointerPropertiesEXT hp2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        int t2 = -1;
+        if (p_host_props(c->device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, (void *)(uintptr_t)r->import_lo, &hp2) == VK_SUCCESS)
+            t2 = memory_type(c, req.memoryTypeBits & hp2.memoryTypeBits,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (t2 >= 0) {
+            ai.memoryTypeIndex = (uint32_t)t2;
+            res = vkAllocateMemory(c->device, &ai, NULL, &r->mem);
+        }
+    }
+    if (res != VK_SUCCESS) r->mem = VK_NULL_HANDLE;
+    uint64_t alloc_ns = qpc() - ta;
+    __atomic_add_fetch(&import_alloc_ns, alloc_ns, __ATOMIC_RELAXED);
+    double alloc_ms = (double)alloc_ns / 1e6;
+    if (alloc_ms > 10.0 && plat_inc32(&n_slow_alloc) <= 32)
+        rt_log("vk: importing %llu MiB of guest memory took %.1f ms in vkAllocateMemory", (unsigned long long)(n >> 20), alloc_ms);
+    if (res != VK_SUCCESS || (res = vkBindBufferMemory(c->device, r->buf, r->mem, 0)) != VK_SUCCESS) {
         rt_log("vk: pool %#llx+%#llx: host memory import failed (%d)", (unsigned long long)addr, (unsigned long long)size, (int)res);
         if (r->mem) vkFreeMemory(c->device, r->mem, NULL);
         vkDestroyBuffer(c->device, r->buf, NULL);
@@ -189,27 +233,36 @@ static int import_pool(VkCtx *c, PoolRec *r, uint64_t addr, uint64_t size) {
 // DKB implementation supplied the measured lazy-import model; this size guard is DKB's allocation-order requirement.
 // TOTK_POOL_LAZY=0 restores fully eager import. Shadow storage copies the guest pages at creation and remains eager.
 #define LAZY_IMPORT_MAX (256ull << 20)
+/* FROM DKB
+// nvnMemoryPoolInitialize only records an imported pool, and the import waits for the first time the GPU resolves an
+// address in it (TOTK_POOL_LAZY=0 imports at once, as before). A profile of a level change showed hundreds of guest-memory
+// imports, each about 20 ms of NVIDIA driver time whatever its size, one at a time, with the guest threads blocked in
+// them; the memory census of the same runs had the GPU resolve only 6% of the imported pools at frame 600 and 27% at
+// frame 5400. On a scripted 72 s route (RTX 5060 Ti) it cut the imports from 3219 to 901 and their total from 27 s to
+// 1.2 s, and the stalls from four of 360 to 950 ms to one of 993 ms.
+// Shadow storage copies the guest pages when it is made, so it always imports at once.
+*/
 static int lazy_enabled(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = cfg_get("TOTK_POOL_LAZY");
         on = !(e && !strcmp(e, "0")) && !shadow_on;
-        if (on) rt_log("DKB-MEMORY-STABILITY: imported pools up to 256 MiB are imported on first GPU use (TOTK_POOL_LAZY=0 disables)");
+        if (on) rt_log("vk: imported pools are imported on their first GPU use (TOTK_POOL_LAZY)");
     }
     return on;
 }
 
-// Caller holds pool_lock shared or exclusive, so finalize cannot free r during the import.
+// The deferred import. The caller holds pool_lock, shared or exclusive: a finalize needs it exclusively, so the record
+// stays alive here. Returns whether r has a GPU buffer afterwards.
 static int lazy_import(PoolRec *r) {
     if (!__atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE)) return r->buf != VK_NULL_HANDLE;
     plat_mutex_lock(&lazy_lock);
     if (r->lazy) {
-        mem_thaw((uintptr_t)r->lo, r->size);
+        mem_thaw((uintptr_t)r->lo, r->size);   // the import may need write access to the pages
         if (!import_pool(vk_ctx(), r, r->lo, r->size)) {
             long n = plat_inc32(&n_import_failures);
-            if (n <= 8)
-                rt_log("vk: pool %#llx (flags %#x, %#llx bytes) has no GPU buffer (%ld so far)",
-                       (unsigned long long)r->lo, r->flags, (unsigned long long)r->size, n);
+            if (n <= 8) rt_log("vk: pool %#llx (flags %#x, %#llx bytes) has no GPU buffer (%ld so far)", (unsigned long long)r->lo,
+                               r->flags, (unsigned long long)r->size, n);
             r->buf = VK_NULL_HANDLE;
         } else {
             plat_inc32(&n_lazy_imports);
@@ -362,7 +415,11 @@ int vk_pool_init(pool_t *p) {
         ok = alloc_physical(c, r);
     } else {
         r->kind = POOL_IMPORT;
+        /* FROM MKW
         if (lazy_enabled() && p->size <= LAZY_IMPORT_MAX) {
+        */
+        if (lazy_enabled()) {
+            // Deferred (lazy_import): the host range is the one import_pool would compute, for code that reads it early.
             uint64_t al = c->min_imported_host_alignment ? c->min_imported_host_alignment : 0x1000;
             r->import_lo = r->lo & ~(al - 1);
             r->import_hi = (r->lo + r->size + al - 1) & ~(al - 1);
@@ -396,6 +453,44 @@ int vk_pool_init(pool_t *p) {
     }
     plat_mutex_unlock(&pool_lock);
     return 1;
+}
+
+// What the release of a used pool waits for before the guest gets its storage back. TOTK_POOL_FINI_WAIT=idle (the
+// default) is the whole graphics queue idle, with the queue lock held, which costs a driver round trip per pool even when
+// the GPU has nothing left: a level change frees many pools one after another (a 1.6 s frame in a TOTK_PROFILE_SLOW dump,
+// five guest threads in turn inside this wait). fence waits for the timeline value of the newest finished submission
+// instead and does not enter the driver when that value is already done. It covers the work the game has synchronized
+// on, which is what a release is allowed to follow; it does not cover the parts that vk_sync_split already submitted
+// for the submission still being recorded (they signal only at its end), which the idle wait did.
+static void pool_fini_wait(VkCtx *c) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = cfg_get("TOTK_POOL_FINI_WAIT");
+        mode = e && !strcmp(e, "fence");
+        if (mode) rt_log("vk: a pool release waits for the newest submission on the timeline (TOTK_POOL_FINI_WAIT=fence)");
+        else if (e && *e && strcmp(e, "idle")) rt_log("vk: TOTK_POOL_FINI_WAIT=%s is not idle or fence: waiting for the queue to idle", e);
+    }
+    if (mode) {
+        uint64_t v = vk_sync_issued();
+        if (v && vk_sync_fence_done() < v) vk_sync_fence_wait(v, UINT64_MAX);
+        return;
+    }
+    vk_queue_lock();
+    vkQueueWaitIdle(c->gfx_queue);
+    vk_queue_unlock();
+}
+
+// Releases of used pools that waited over 10 ms are logged (the first 64 of them), with the running total of all waits.
+static volatile int32_t pf_slow;
+static volatile uint64_t pf_flush_ns, pf_wait_ns;
+static void pool_fini_note(uint64_t size, uint64_t flush_ns, uint64_t wait_ns) {
+    __atomic_add_fetch(&pf_flush_ns, flush_ns, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&pf_wait_ns, wait_ns, __ATOMIC_RELAXED);
+    if (flush_ns + wait_ns <= 10000000ull) return;
+    long n = plat_inc32(&pf_slow);
+    if (n <= 64)
+        rt_log("vk: used pool of %llu MiB released: upload flush %.1f ms, wait for the GPU %.1f ms (slow release %ld; %.0f ms in all releases so far)",
+               (unsigned long long)(size >> 20), flush_ns / 1e6, wait_ns / 1e6, n, (pf_flush_ns + pf_wait_ns) / 1e6);
 }
 
 void vk_pool_fini(pool_t *p) {
@@ -436,10 +531,11 @@ void vk_pool_fini(pool_t *p) {
     // guest gets the storage back when this returns.
     vk_texture_range_gone(r->lo, r->size, r->alloc);
     if (r->used && r->kind != POOL_VIRT) {
+        uint64_t t0 = qpc();
         vk_upload_flush(1);
-        vk_queue_lock();
-        vkQueueWaitIdle(c->gfx_queue);
-        vk_queue_unlock();
+        uint64_t t1 = qpc();
+        pool_fini_wait(c);
+        pool_fini_note(r->size, t1 - t0, qpc() - t1);
     }
     vk_mem_collect();
     // A mirrored pool's record and buffers outlive the submission being recorded, whose sync copies and write-backs may
@@ -609,6 +705,8 @@ int vk_mem_inspect(uint64_t addr, uint64_t size, VkMemInspect *out) {
     uint64_t remaining = r->size - rel;
     result.pool_flags = r->flags;
     if (r->kind == POOL_IMPORT) {
+        // A pool still waiting for its first GPU use has no buffer yet: the callers are passive diagnostics, so they
+        // report it as not backed instead of paying a ~20 ms import for a log line.
         if (!r->buf || addr < r->import_lo || addr + size > r->import_hi) goto done;
         result.pool_kind = VK_MEM_INSPECT_POOL_IMPORT;
         result.offset = addr - r->import_lo;
@@ -718,7 +816,7 @@ static int resolve_locked(uint64_t addr, uint64_t size, VkMemSpan *out) {
     const pidx_ent *e = pidx_find(&pool_index, (uintptr_t)addr, size);
     PoolRec *r = e ? e->buf : NULL;
     int ok = 0;
-    if (r && r->kind == POOL_IMPORT && __atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE)) lazy_import(r);
+    if (r && r->kind == POOL_IMPORT && __atomic_load_n(&r->lazy, __ATOMIC_ACQUIRE)) lazy_import(r);   // first GPU use
     if (r && (r->kind == POOL_IMPORT ? r->buf != VK_NULL_HANDLE : r->kind == POOL_PHYS)) {
         int i = (int)(e - pool_index.e);
         if ((i == 0 || pool_index.maxhi[i - 1] <= e->lo) && (i + 1 == pool_index.n || pool_index.e[i + 1].lo >= e->hi)) {
@@ -832,10 +930,11 @@ void vk_mem_census(uint64_t frame) {
     typedef struct { int kind; uint32_t flags; uint64_t n, bytes; } Group;
     Group g[64];
     int ng = 0;
-    uint64_t total[4] = {0}, count[4] = {0};
+    uint64_t total[4] = {0}, count[4] = {0}, used_n = 0, used_bytes = 0;
     plat_mutex_lock_shared(&pool_lock);
     for (int i = 0; i < pool_index.n; i++) {
         const PoolRec *r = pool_index.e[i].buf;
+        if (r->kind == POOL_IMPORT && r->used) used_n++, used_bytes += r->size;
         int j = 0;
         while (j < ng && (g[j].kind != r->kind || g[j].flags != r->flags)) j++;
         if (j == ng && ng < 64) g[ng++] = (Group){r->kind, r->flags, 0, 0};
@@ -850,11 +949,20 @@ void vk_mem_census(uint64_t frame) {
            (unsigned long long)count[POOL_VIRT], total[POOL_VIRT] / 1048576.0);
     // M15.23: mapped virtual pages are not necessarily resident VkImage tiles. A census is not proof of
     // texture data, sparse image residency, or a presented pixel.
+
+    /* FROM MKW
     uint64_t vt = 0, vm = 0, vg = 0;
     vk_dkb_virtual_page_stats(&vt, &vm, &vg);
     rt_log("DKB-VPAGE: at frame %llu mapped %llu/%llu virtual 64KiB pages (%.1f/%.1f MiB), gen %llu; no sparse images bound",
            (unsigned long long)frame, (unsigned long long)vm, (unsigned long long)vt,
            vm / 16.0, vt / 16.0, (unsigned long long)vg);
+    */
+   
+    // How many imported pools the GPU has resolved at least once: the rest paid the import (about 20 ms of driver time
+    // each on NVIDIA, whatever the size) for memory that only the CPU touched.
+    rt_log("mem: of the %llu imported pools, %llu (%.1f MiB) were resolved by the GPU so far; %.0f ms in all imports (%d, %d of them on first GPU use)",
+           (unsigned long long)count[POOL_IMPORT], (unsigned long long)used_n, used_bytes / 1048576.0,
+           __atomic_load_n(&import_alloc_ns, __ATOMIC_RELAXED) / 1e6, n_imports, n_lazy_imports);
     static const char *const kinds[] = {"", "import", "physical", "virtual"};
     for (int j = 0; j < ng; j++) {
         char f[160];
@@ -1164,7 +1272,8 @@ static int query_stamp(uint64_t lo, uint64_t hi, uint32_t g) {
 // - GPU -> guest: the replay notes each GPU write into CPU-visible memory at record time (vk_mem_gpu_pending) and
 //   reports it at the fence (vk_gpu_written), which copies those bytes back into guest memory. Until then the CPU
 //   copies skip them: a page the CPU and the GPU both write keeps the GPU's bytes.
-// TOTK_SHADOW=1/0 forces the mode on or off; the default is on for Linux.
+// TOTK_SHADOW=1/0 forces the mode on or off; the default is on for Linux, off where importing is cheap (Windows, and
+// MoltenVK, which imports host memory without Linux's write-watch and page re-protection).
 typedef struct { uint64_t lo, hi; } SRange;
 static PlatMutex shadow_lock = PLAT_MUTEX_INIT;   // after pool_lock; before gen_lock
 static PoolRec **stouch;                          // shadow_lock: pools resolved since the last sync
@@ -1562,7 +1671,7 @@ static void mirror_mode(int discrete) {
     freeze_idle = fi && *fi ? atoi(fi) : 60;
     if (freeze_idle < 0) freeze_idle = 0;
     const char *sh = cfg_get("TOTK_SHADOW");
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
     shadow_on = sh && *sh && strcmp(sh, "0");
 #else
     shadow_on = !sh || !*sh || strcmp(sh, "0");

@@ -116,6 +116,9 @@
 # not apply: at 150% scale, 1920x1080 covers the area 1280x720 covers at 100%. F11 switches fullscreen and saves it
 # here. Changes while the game runs take effect at once.
 # window_size = 1920x1080
+# windowed, borderless (over the screen) or fullscreen (the display's own mode with SDL windows; on Windows, borderless
+# kept above every other window). Wins over fullscreen below when both are set.
+# window_mode = windowed
 # fullscreen = 0
 # 1, the default: the game keeps running while you are in another window; the keyboard stays quiet until the window is
 # in front again. 0: it pauses when its window loses focus, as it does on the Switch when Home is pressed; a load
@@ -142,6 +145,10 @@
 # from 0 (off) to 100. Changes while the game runs take effect at once.
 # upscaler = fsr
 # sharpness = 80
+# SMAA 1x anti-aliasing of the final picture: off (the default), low, medium or high. It runs after the picture is scaled to
+# the window (FSR or bilinear) and before the menu is drawn, so the game's HUD is smoothed as well. Changes while the game
+# runs take effect at once.
+# smaa = off
 # Picture shape when the window's shape differs from the game resolution's (a 16:9 picture in a 21:9 fullscreen
 # window): fit, the default, keeps the shape, with black bars at the sides or above and below, so a 16:9 game in a wider
 # window is no longer stretched as it used to be; stretch fills the window. Changes while the game runs take effect at
@@ -177,6 +184,10 @@
 # audio_prefill_ms = 20
 # Volume in percent (0 to 100), on top of the game's own. Changes while the game runs take effect at once.
 # volume = 100
+# Speakers: auto (5.1 when the default output device has six or more channels, stereo otherwise), stereo or 5.1. The
+# game is told the same channel count and mixes for it. Falls back to stereo if the device refuses 5.1. Takes effect
+# at the next start.
+# audio_channels = auto
 
 [input]
 # Gamepad motion controls (0 = off) and vibration (0 = off).

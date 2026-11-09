@@ -17,8 +17,9 @@ As far as we know, no other static recompilation of a Switch 2 game is public.
 
 > [!IMPORTANT]
 > **No game files are included, and none ever will be.** You need your own copy of *Donkey Kong Bananza*, dumped
-> from your own console. Instructions for obtaining those files will not be provided. There are no downloadable
-> builds: everyone builds from their own dump.
+> from your own console. Instructions for obtaining those files will not be provided. The game itself is never
+> downloadable: the [release](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/latest) carries the installer, and
+> everyone builds the game from their own dump.
 
 ## Status
 
@@ -28,7 +29,8 @@ hand-played run reached the Ingot Isle Cave-In section. It still
 can crash (on NVIDIA two light quads are skipped to avoid a GPU fault,
 [#9](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/9)), and
 many effects are missing.
-There is no release. An installer builds the game from your own dump: [docs/installer.md](docs/installer.md).
+The [latest release](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/latest) carries an installer that
+builds the game from your own dump: [docs/installer.md](docs/installer.md).
 Progress, day by day: [docs/devlog.md](docs/devlog.md).
 
 | Phase | | State |
@@ -133,15 +135,24 @@ Everything the build writes stays under `build\` and `generated\`, which git ign
 
 ## FAQ
 
-**Can I play it?** Not yet. It reaches the tutorial and crashes often. Follow the
+**Can I play it?** Partly. One hand-played run went from the title screen through the tutorial, its cutscene and the
+first stage to its end on an RTX 5060 Ti, with drops while a new area loads; other cards are untested and it can still
+crash. Follow the
 [roadmap](https://github.com/Lucas-blip-png/dkb-pc-recomp/issues/10) or the [devlog](docs/devlog.md).
 
-**Will there be a download?** No. The executable is made from the game's own code, so it cannot be shared. Everyone
-builds it from their own dump; the installer does this for you ([docs/installer.md](docs/installer.md)).
+**Is there a download?** Of the installer, on the [release page](https://github.com/Lucas-blip-png/dkb-pc-recomp/releases/latest).
+The executable is made from the game's own code, so it cannot be shared. Everyone builds it from their own dump; the
+installer does this for you ([docs/installer.md](docs/installer.md)).
 
-**Which version of the game?** Base 1.0.0. Update 458752 has a different layout and is not supported yet.
+**Which version of the game?** Base 1.0.0 and update 3.2.0 (title version 458752, the newest). The installer takes either a `.nup` file (the container Eglantine and Eden load; with the 3.2.0 update inside it builds 3.2.0) or ExeFS and RomFS folders. Other updates are refused by their hashes. The 3.2.0 build installs and boots, and held 60 fps for 150 s at the start on an RTX 5060 Ti, but nobody has played it yet. Add-on content (DLC) has a reader (an `aoc-<n>` folder beside the executable, [docs/dkb-testing.md](docs/dkb-testing.md)) checked against synthetic packs and a real one, but it has not been tried in the game.
 
-**Linux?** TotK Recomp's toolchain supports Linux, so it is possible; nobody has tried with Bananza yet.
+**Linux?** Preview. The release page carries `DKB-Setup-<version>-linux-x86_64.tar.gz`: the sources and a setup script, not a
+binary. You install the system packages and it builds the game from your dump. The build from source is verified on AMD
+and NVIDIA GPUs ([docs/installer.md](docs/installer.md), "Bananza Linux and macOS packages").
+
+**macOS?** Preview. `DKB-Setup-<version>-macos-arm64.zip` is the same kind of package. It builds and boots on Apple
+Silicon with MoltenVK: the game reaches the mode select ([docs/building.md](docs/building.md), "macOS"). It is not
+verified beyond that, and the destructible terrain is missing until the geometry stages have a vertex-stage replacement.
 
 **Why GPL?** The shader lowering comes from Eglantine (Eden Emulator Project), which is GPL. Files that came from TotK
 Recomp keep their MIT terms.

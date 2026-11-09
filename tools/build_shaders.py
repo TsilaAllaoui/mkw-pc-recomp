@@ -11,6 +11,7 @@ shader. Needs glslc and spirv-val from MSYS2 UCRT64 (package mingw-w64-ucrt-x86_
 import argparse
 import hashlib
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -22,8 +23,20 @@ WIN = os.name == 'nt'
 TARGET = 'vulkan1.1'
 
 
-def source_hash(src):
-    return hashlib.sha256(src.read_bytes().replace(b'\r\n', b'\n')).hexdigest()   # the same on a CRLF checkout
+INCLUDE = re.compile(rb'^\s*#\s*include\s*"([^"]+)"', re.M)
+
+
+def source_hash(src, seen=None):
+    """SHA-256 of the shader and, recursively, of every file it #includes (resolved next to the including file, as glslc does)."""
+    seen = set() if seen is None else seen
+    data = src.read_bytes().replace(b'\r\n', b'\n')   # the same on a CRLF checkout
+    h = hashlib.sha256(data)
+    seen.add(src.resolve())
+    for m in INCLUDE.finditer(data):
+        inc = (src.parent / m.group(1).decode()).resolve()
+        if inc.exists() and inc not in seen:
+            h.update(source_hash(inc, seen).encode())
+    return h.hexdigest()
 
 
 def header_of(src, words):

@@ -23,9 +23,42 @@ extern "C" {
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 }
 
-static const ImU32 kGold = IM_COL32(236, 194, 84, 255);
-static const ImU32 kDim = IM_COL32(150, 150, 140, 255);
-static const ImU32 kGrey = IM_COL32(110, 110, 102, 255);
+// The colours of the rows. "classic" is the SavageWindRecomp look the menu started with; "dk" is the jungle-bark and
+// banana palette (menu.cpp style_init has the window colours of both). opt_theme picks one.
+struct Pal {
+    bool dk;
+    ImU32 gold, dim, grey;
+    ImU32 fill_idle, fill_on;                            // row background: idle, hovered or selected
+    ImU32 border_idle, border_idle_off, border_on_off;   // row border: idle, idle when greyed out, hovered when greyed out
+    ImU32 arrows_idle, divider;
+    ImU32 label, value_default, value_set, off_note, set_note;
+    ImU32 cell_off_border, cell_text;
+    ImVec4 accent, warn;
+};
+static const Pal kClassic = {false, IM_COL32(236, 194, 84, 255), IM_COL32(150, 150, 140, 255), IM_COL32(110, 110, 102, 255),
+                             IM_COL32(0, 0, 0, 40), IM_COL32(255, 255, 255, 22),
+                             IM_COL32(255, 255, 255, 38), IM_COL32(255, 255, 255, 18), IM_COL32(236, 194, 84, 120),
+                             IM_COL32(170, 170, 160, 255), IM_COL32(236, 194, 84, 110),
+                             IM_COL32(240, 236, 224, 255), IM_COL32(205, 205, 195, 255), IM_COL32(255, 255, 255, 255),
+                             IM_COL32(200, 150, 90, 255), IM_COL32(220, 170, 100, 255),
+                             IM_COL32(255, 255, 255, 14), IM_COL32(255, 255, 255, 255),
+                             ImVec4(0.93f, 0.76f, 0.33f, 1), ImVec4(0.95f, 0.66f, 0.40f, 1)};
+static const Pal kDk = {true, IM_COL32(246, 197, 43, 255), IM_COL32(190, 168, 138, 255), IM_COL32(140, 120, 98, 255),
+                        IM_COL32(0, 0, 0, 70), IM_COL32(246, 197, 43, 34),
+                        IM_COL32(107, 74, 42, 255), IM_COL32(107, 74, 42, 110), IM_COL32(246, 197, 43, 120),
+                        IM_COL32(190, 168, 138, 255), IM_COL32(107, 74, 42, 255),
+                        IM_COL32(243, 233, 210, 255), IM_COL32(231, 214, 184, 255), IM_COL32(255, 244, 214, 255),
+                        IM_COL32(214, 150, 90, 255), IM_COL32(240, 190, 100, 255),
+                        IM_COL32(107, 74, 42, 140), IM_COL32(255, 244, 214, 255),
+                        ImVec4(246 / 255.f, 197 / 255.f, 43 / 255.f, 1), ImVec4(1.0f, 0.54f, 0.46f, 1)};
+static const Pal *P = &kClassic;
+#define kGold (P->gold)
+#define kDim (P->dim)
+#define kGrey (P->grey)
+
+void opt_theme(bool dk) { P = dk ? &kDk : &kClassic; }
+ImVec4 opt_accent(void) { return P->accent; }
+ImVec4 opt_warn(void) { return P->warn; }
 
 static float g_scale = 1;
 static bool g_focus_req, g_take_first;   // opt_focus_first: requested / this page's first row takes it
@@ -87,7 +120,7 @@ void opt_end(void) {
     avail.y -= g_bottom;
     float gap = 24 * g_scale;
     ImGui::GetWindowDrawList()->AddLine(ImVec2(p.x + gap * 0.5f, p.y), ImVec2(p.x + gap * 0.5f, p.y + avail.y),
-                                        IM_COL32(236, 194, 84, 110), 1.0f);
+                                        P->divider, P->dk ? 2.0f : 1.0f);
     ImGui::SetCursorScreenPos(ImVec2(p.x + gap, p.y));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14 * g_scale, 6 * g_scale));
     ImGui::BeginChild("##desc", ImVec2(0, avail.y), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoNav);
@@ -105,6 +138,8 @@ struct RowView {
     bool is_default;     // the value is the setting's default: the "default" mark, the value not highlighted
     bool arrows;         // a stepper: < value >, the arrows click too
     const char *note;    // under the value instead of the "default" mark; NULL for none
+    int pill = 0;        // dk theme: the value sits in a green (1) or red (2) pill, a toggle's on / off
+    float frac = -1;     // dk theme: a slider's position 0..1 drawn as a track with a grab; -1 none
 };
 
 // One row: draws it, handles A / click and left / right while selected. Returns 2 (A / click), -1 / +1 (left / right) or
@@ -152,18 +187,23 @@ static int row(const char *key, UiTextId label, UiTextId desc, const RowView &v)
 
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImFont *font = ImGui::GetFont();
-    float r = 9 * g_scale, pad = 16 * g_scale, small = fs * 0.72f;
-    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), hov || foc ? IM_COL32(255, 255, 255, 22) : IM_COL32(0, 0, 0, 40), r);
+    float r = (P->dk ? 6 : 9) * g_scale, pad = 16 * g_scale, small = fs * 0.72f;
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), hov || foc ? P->fill_on : P->fill_idle, r);
     dl->AddRect(p, ImVec2(p.x + w, p.y + h),
-                hov || foc ? (off ? IM_COL32(236, 194, 84, 120) : kGold) : IM_COL32(255, 255, 255, off ? 18 : 38), r, 0,
-                hov || foc ? 2.0f : 1.0f);
+                hov || foc ? (off ? P->border_on_off : kGold) : off ? P->border_idle_off : P->border_idle, r, 0,
+                hov || foc ? (P->dk ? 2.5f * g_scale : 2.0f) : P->dk ? 1.5f * g_scale : 1.0f);
+    if (P->dk) {   // the plank's bevel: a light edge on top, a dark one under
+        dl->AddLine(ImVec2(p.x + r, p.y + 2 * g_scale), ImVec2(p.x + w - r, p.y + 2 * g_scale), IM_COL32(255, 255, 255, 16));
+        dl->AddLine(ImVec2(p.x + r, p.y + h - 2 * g_scale), ImVec2(p.x + w - r, p.y + h - 2 * g_scale),
+                    IM_COL32(0, 0, 0, 70));
+    }
     float ty = p.y + fs * 0.25f, ny = p.y + fs * 1.3f;   // the label line and the note line under it
     float right = p.x + w - pad;                         // the value's right edge
     float value_left = right;
     if (v.arrows && v.value[0]) {   // < value >, drawn (the font has no arrow glyphs); a click on one steps
         float aw = fs * 0.42f, gap = fs * 0.55f, cy = ty + fs * 0.52f;
         float rx = right - aw, lx = rx - gap - ImGui::CalcTextSize(v.value).x - gap - aw;
-        ImU32 ac = off ? kGrey : hov || foc ? kGold : IM_COL32(170, 170, 160, 255);
+        ImU32 ac = off ? kGrey : hov || foc ? kGold : P->arrows_idle;
         dl->AddTriangleFilled(ImVec2(lx, cy), ImVec2(lx + aw, cy - aw * 0.75f), ImVec2(lx + aw, cy + aw * 0.75f), ac);
         dl->AddTriangleFilled(ImVec2(rx + aw, cy), ImVec2(rx, cy - aw * 0.75f), ImVec2(rx, cy + aw * 0.75f), ac);
         if (clicked && !off) {
@@ -176,24 +216,40 @@ static int row(const char *key, UiTextId label, UiTextId desc, const RowView &v)
     }
     if (v.value[0]) {
         float vx = right - ImGui::CalcTextSize(v.value).x;
-        dl->AddText(ImVec2(vx, ty), off ? kGrey : v.is_default ? IM_COL32(205, 205, 195, 255) : IM_COL32(255, 255, 255, 255),
-                    v.value);
-        if (!v.arrows) value_left = vx;
+        ImU32 vc = off ? kGrey : v.is_default ? P->value_default : P->value_set;
+        if (P->dk && v.pill) {   // green for on, red for off; the text stays white for contrast
+            float px = fs * 0.5f;
+            vx -= px;
+            dl->AddRectFilled(ImVec2(vx - px, ty + fs * 0.02f), ImVec2(right, ty + fs * 0.98f),
+                              v.pill == 1 ? IM_COL32(46, 125, 43, off ? 120 : 255) : IM_COL32(168, 42, 32, off ? 120 : 255),
+                              fs * 0.5f);
+            vc = off ? kGrey : IM_COL32(255, 255, 255, 255);
+            value_left = vx - px;
+        }
+        dl->AddText(ImVec2(vx, ty), vc, v.value);
+        if (!v.arrows && !v.pill) value_left = vx;
     }
     if (v.note || v.is_default) {   // under the value, right-aligned with it
         const char *t = v.note ? v.note : menu_text(UI_MENU_DEFAULT_MARK);
         float tw = font->CalcTextSizeA(small, FLT_MAX, 0, t).x;
-        dl->AddText(font, small, ImVec2(right - tw, ny), v.note ? IM_COL32(220, 170, 100, 255) : kDim, t);
+        dl->AddText(font, small, ImVec2(right - tw, ny), v.note ? P->set_note : kDim, t);
     }
     // the label and its note, clipped before the value
     ImVec4 clip(p.x, p.y, value_left - fs * 0.6f, p.y + h);
-    dl->AddText(font, fs, ImVec2(p.x + pad, ty), off ? kGrey : IM_COL32(240, 236, 224, 255), menu_text(label), NULL, 0,
+    dl->AddText(font, fs, ImVec2(p.x + pad, ty), off ? kGrey : P->label, menu_text(label), NULL, 0,
                 &clip);
     const char *note = disabled        ? disabled
                      : off             ? menu_text(UI_MENU_SET_BY_ENV)
                      : m && !m->live ? menu_text(UI_MENU_AFTER_RESTART)
                                      : NULL;
-    if (note) dl->AddText(font, small, ImVec2(p.x + pad, ny), off ? IM_COL32(200, 150, 90, 255) : kDim, note);
+    if (note) dl->AddText(font, small, ImVec2(p.x + pad, ny), off ? P->off_note : kDim, note);
+    if (P->dk && v.frac >= 0) {   // the slider's track with a banana grab, along the row's foot
+        float x0 = p.x + pad, x1 = p.x + w - pad, y = p.y + h - 5 * g_scale, gx = x0 + (x1 - x0) * v.frac;
+        dl->AddLine(ImVec2(x0, y), ImVec2(x1, y), IM_COL32(0, 0, 0, 140), 3 * g_scale);
+        dl->AddLine(ImVec2(x0, y), ImVec2(gx, y), off ? kGrey : kGold, 3 * g_scale);
+        dl->AddCircleFilled(ImVec2(gx, y), 5.5f * g_scale, off ? kGrey : kGold);
+        dl->AddCircle(ImVec2(gx, y), 5.5f * g_scale, IM_COL32(42, 26, 14, 255), 0, 1.5f * g_scale);
+    }
     ImGui::PopID();
     return off ? 0 : step;
 }
@@ -231,6 +287,7 @@ bool opt_toggle(const char *key, UiTextId label, UiTextId desc, bool inverted) {
     bool set = cfg_bool(key) != 0, def = m && strcmp(m->def, "0") != 0;
     bool on = set != inverted;   // what the row shows
     RowView v = {menu_text(on ? UI_MENU_ON : UI_MENU_OFF), set == def, false, NULL};
+    v.pill = on ? 1 : 2;
     if (!row(key, label, desc, v)) return false;   // any step flips it
     apply(key, set ? "0" : "1");
     return true;
@@ -243,12 +300,12 @@ bool opt_button(const char *id, UiTextId label, UiTextId desc, const char *value
 
 void opt_group(UiTextId title) {
     ImGui::Dummy(ImVec2(0, 6 * g_scale));
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", menu_text(title));
+    ImGui::TextColored(P->accent, "%s", menu_text(title));
 }
 
 void opt_text(UiTextId text, bool warn) {
     ImGui::PushTextWrapPos(0);
-    if (warn) ImGui::TextColored(ImVec4(0.95f, 0.66f, 0.40f, 1), "%s", menu_text(text));
+    if (warn) ImGui::TextColored(P->warn, "%s", menu_text(text));
     else ImGui::TextUnformatted(menu_text(text));
     ImGui::PopTextWrapPos();
 }
@@ -300,6 +357,7 @@ bool opt_slider(const char *key, UiTextId label, float lo, float hi, UiTextId de
     char shown[48];
     snprintf(shown, sizeof shown, fmt, v);
     RowView rv = {shown, fabs(v - def) < step * 0.01, true, NULL};
+    rv.frac = hi > lo ? (float)fmin(1.0, fmax(0.0, (v - lo) / (hi - lo))) : 0;
     int s = row(key, label, desc, rv);
     if (!s) return false;
     int steps = g_held && (hi - lo) > 40 * step ? 10 : 1;   // held: ten steps at a time over a long range
@@ -358,15 +416,15 @@ int opt_bind_row(const char *key, const char *label, UiTextId desc, const char *
     float fs = ImGui::GetFontSize(), w = ImGui::GetContentRegionAvail().x, h = floorf(fs * 1.9f), cx[3], cw;
     bind_columns(p.x, w, cx, &cw);
     ImDrawList *dl = ImGui::GetWindowDrawList();
-    float r = 8 * g_scale, pad = 6 * g_scale;
-    fit_text(dl, p.x + 16 * g_scale, cx[0] - fs * 0.3f, p.y, h, IM_COL32(240, 236, 224, 255), label, false);
+    float r = (P->dk ? 6 : 8) * g_scale, pad = 6 * g_scale;
+    fit_text(dl, p.x + 16 * g_scale, cx[0] - fs * 0.3f, p.y, h, P->label, label, false);
     int result = -1;
     bool row_foc = false, row_hov = false;
     for (int c = 0; c < 3; c++) {
         ImVec2 a(cx[c], p.y), b(cx[c] + cw, p.y + h);
         const char *t = cells[c] && cells[c][0] ? cells[c] : "-";
         if (!enabled[c]) {   // not a nav item: the cursor skips it
-            dl->AddRect(a, b, IM_COL32(255, 255, 255, 14), r);
+            dl->AddRect(a, b, P->cell_off_border, r);
             fit_text(dl, a.x + pad, b.x - pad, a.y, h, kGrey, t, true);
             continue;
         }
@@ -393,9 +451,9 @@ int opt_bind_row(const char *key, const char *label, UiTextId desc, const char *
         if (foc && (ImGui::IsKeyPressed(ImGuiKey_Delete, false) || ImGui::IsKeyPressed(ImGuiKey_Backspace, false) ||
                     ImGui::IsKeyPressed(ImGuiKey_GamepadFaceUp, false)))
             result = 10 + c;
-        dl->AddRectFilled(a, b, hov || foc ? IM_COL32(255, 255, 255, 22) : IM_COL32(0, 0, 0, 40), r);
-        dl->AddRect(a, b, hov || foc ? kGold : IM_COL32(255, 255, 255, 38), r, 0, hov || foc ? 2.0f : 1.0f);
-        fit_text(dl, a.x + pad, b.x - pad, a.y, h, IM_COL32(255, 255, 255, 255), t, true);
+        dl->AddRectFilled(a, b, hov || foc ? P->fill_on : P->fill_idle, r);
+        dl->AddRect(a, b, hov || foc ? kGold : P->border_idle, r, 0, hov || foc ? 2.0f : 1.0f);
+        fit_text(dl, a.x + pad, b.x - pad, a.y, h, P->cell_text, t, true);
         ImGui::PopID();
     }
     char k[64];
