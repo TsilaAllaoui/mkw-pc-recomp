@@ -15,6 +15,12 @@ __pycache__/
 /game/
 /build/
 /generated/
+/workspace/
+/output/
+/reference/
+/archive/
+/handoff/
+/fork/
 # Never publish extracted console files, packed filesystem images, keys, tickets or dumps even when a local tool puts
 # them outside the conventional game/build directories.
 **/[Ee]xe[Ff][Ss]/
