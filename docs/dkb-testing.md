@@ -99,6 +99,9 @@ Useful settings, as environment variables (`set NAME=value` in the same Command 
 | `DKB_DUMP_SPV=1` | Debug only, for diagnosing #75: writes the exact SPIR-V passed to `vkCreateShaderModule` for each graphics and compute shader (after every rewrite) to `spv/<vs\|fs\|gs\|cs>-<NVN 2 stage origin>-<FNV-1a 64>.spv` next to `dkb.log`, so a SPIR-V hash from an Nsight Aftermath dump maps to its NVN 2 stage; up to 1 GiB, one `vk: spv dump` log line per file. Off by default. The files can hold code derived from the game: never attach them. |
 | `DKB_SPV_OVERRIDE=<hash>:<path.spv>[,<hash>:<path.spv>...]` | Debug only, for #75: a shader module whose final SPIR-V has this FNV-1a 64 hash (16 hex digits, the last part of a `DKB_DUMP_SPV` file name) is created from the given file instead (multiple of 4 bytes, up to 16 MiB; max 8 entries). One `vk: SPIR-V override` log line per replaced module. Off by default. |
 | `DKB_NAN_GUARD=zero` (default), `mark` or `0` | Fragment stages store 0 in place of NaN in their float colour outputs (`spirv_nan_guard.c`). A NaN texel in the HDR scene colour is spread by the bloom into a glowing band crossed by black lines; two frame dumps from a challenge room on an RX 9070 XT had NaN right after the lit opaque pass, which the console does not show. `mark` writes a colour named by the stage instead: r, g and b are each 0, 1, 4 or 16 from bits of the stage's SPIR-V hash (the `fs` hash in a dump's `passes.txt`), and the log lists `vk: fs <hash>: NaN marked as <r> <g> <b>` for each stage, so a dump's `_tm` image shows which stage writes the NaN. `0` stores what the shader computed. The guard tests the float's bits (`(bits & 0x7fffffff) > 0x7f800000`), not `OpIsNan`, which a driver may fold to false because the translator never enables `SignedZeroInfNanPreserve`. It changes the final SPIR-V hash of every fragment stage, so `DKB_SPV_OVERRIDE` hashes and `DKB_DUMP_SPV` file names taken under another `DKB_NAN_GUARD` value do not match. Tested by `tests/nan_guard_spirv_test.py --cc clang --spirv-val spirv-val --out <dir>`. |
+| `DKB_HDR_NATIVE=1` (`hdr_native = 1`, the menu's "Game's own HDR" under HDR), with `hdr = 1` | Game 3.2.0 only, untested on 1.0.0, where it stays off; checked by eye on one HDR TV so far, so reports from other displays are welcome. Tells the game the display is HDR while the swapchain is HDR10 (`ov_gfx.c` `hdr_answer`), so it renders its own Rec. 2020 PQ picture into an A2B10G10R10 window texture that the present copies onto the HDR10 swapchain without FSR, SMAA or the colour adjustment. On a fallback to SDR the game is told so and goes back to its SDR picture. `spirv_hdr_shoulder.c` takes its composite's highlights up to the peak (`hdr_peak_nits`, at most the game's own 1400 nits), which the display is also told; the game's own curve stops at about 1.36 times `hdr_game_nits`. Existing `DKB_SPV_OVERRIDE` files keyed by hash stop matching the rewritten composite. The rewrite is tested by `tests/hdr_shoulder_spirv_test.py --cc clang --spirv-val spirv-val --out <dir>`. To check a picture without an HDR display, dump a bright frame (`DKB_DUMP=key`, F9) and run `tools/hdr_frame_stats.py <dump folder>`: peak, paper white share, clipping and gamut in nits. See `docs/hdr-native-plan.md`. |
+| `DKB_HDR_TRACE=1` (`hdr_trace = 1`) | Logs the game's HDR and colour-space calls (`hdr-trace:` lines: the first 20 of each, then every 600th, with the caller) and the window texture's format when it changes. |
+| `DKB_HDR_SHOULDER=0` | With `DKB_HDR_NATIVE=1`: leaves the game's HDR composite as the game made it, so its highlights stop at about 1.36 times `hdr_game_nits` (`spirv_hdr_shoulder.c` off). For a comparison, or to rule out the rewrite when a scene looks wrong; default 1. |
 | `DKB_FMZ=0`, `vertex` (default) or `all` | Workaround for #75, on for vertex stages by default (`0` turns it off): rewrites 32-bit float `OpFMul` and GLSL.std.450 `Fma` in the final SPIR-V so `0 * x = 0` even for Inf and NaN (NVIDIA's fused-multiply-zero rule). `vertex` touches vertex-stage modules only, `all` every stage. One `vk: FMZ rewrite <hash> mul=<n> fma=<m>` log line per rewritten module; `DKB_DUMP_SPV` shows the rewritten bytes. `DKB_FMZ_SEL=<mask>:<value>` (hex) limits it to the modules whose FNV-1a 64 hash before the rewrite satisfies `(hash & mask) == value`, so `1:0` and `1:1` split the set in halves for a bisection. |
 | `DKB_FIX_POOL_GUARD=0` | Turns off the workaround for #126 (on by default, 1.0.0 only): five guards in the layer-change loop `main+0x410680` keep list entries and cells that hold reused memory out of its work (`recomp/patches-dkb100.txt`, set `poolguard`). Failed checks are counted and logged as `patches: guard ... failed` lines (the first 32, then at each power of two). |
 | `TOTK_TRACE=codec` | Log each call of the video decoder that moves a buffer or a picture. For guide movies that stop or show a flat colour. |
@@ -174,9 +177,10 @@ and `DKB_HUD_POSITION=edges|centered`. Overrides lock the corresponding F1 contr
 otherwise choices are saved in `dkb.ini` (an existing `totk.ini` is copied to it on the first run; `TOTK_*` environment variables still work, and `DKB_*` ones win over them). Turning Ultrawide off allows the 16:9 presets
 and skips the wide overlay. Invalid sizes fall back to the original 2880x1620 dimensions.
 
-5120x1440 (32:9) and 3840x2160 failed during render-resource creation and are excluded
-from the menu. Diagnostic overrides can accept larger sizes but do not establish support.
-Coverage remains limited to short Windows/NVIDIA runs; other scenes and GPUs need testing.
+5120x1440 (32:9) and 3840x2160 used to fail during render-resource creation because the game's
+render-target pool is a fixed 200 MiB; a patch grows it with the output size. Both now run on 1.0.0
+on an RTX 5060 Ti (short runs); 3840x2160 also runs on update 3.2.0 (pools of 356 MiB, 90 s at 60 fps).
+5120x1440 on 3.2.0 and other GPUs are untested.
 
 Run the layout, projection/register-preservation, and configuration checks with:
 
@@ -186,6 +190,8 @@ python tests/dkb_wide_projection_test.py
 python tests/dkb_wide_projection_test.py --table recomp/patches-dkb458752.txt
 clang -O2 -march=x86-64-v3 -I runtime tests/dkb_wide_test.c -o build/dkb-wide-test.exe
 build/dkb-wide-test.exe
+clang -O2 -I runtime tests/res_upscaler_test.c -o build/res-upscaler-test.exe
+build/res-upscaler-test.exe
 build/ultrawide/dkb.exe --probe-cfg
 ```
 

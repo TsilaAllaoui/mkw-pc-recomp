@@ -3058,6 +3058,18 @@ static int dlss_upscale(VkExec *ex, const GfxShader *cs) {
     return vk_dlss_record(ex->cb, ex->fence, s, t);
 }
 
+// Tells the HUD (resolution.c res_note_upscaler) the sizes of every dispatch of the game's upscaler, whatever replaces
+// it (blit, DLSS) or none: same slots as dlss_upscale, the input texture 0 and the output image 1.
+static void note_upscaler(VkExec *ex, const GfxShader *cs) {
+    if (!mvk_upscale_cs(gfx_shader_spirv_fnv(cs))) return;
+    uint64_t hs = ex->tex[NVN_STAGE_CS][0], hd = ex->img[NVN_STAGE_CS][1];
+    view_t vs, vd;
+    int hvs = 0, hvd = 0;
+    const VkTexImage *s = hs ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hs), &vs, &hvs) : NULL;
+    const VkTexImage *t = hd ? vk_texture_by_id(&ex->tex_pool, NVN_HANDLE_TEX(hd), &vd, &hvd) : NULL;
+    if (s && t) res_note_upscaler(s->width, s->height, t->width, t->height);
+}
+
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     static int skip = -1;   // DKB_SKIP_COMPUTE=1: drop every direct dispatch (bisecting GPU faults)
@@ -3079,6 +3091,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     twin_dispatch = 1;
     bind_resources(ex, info);
     twin_dispatch = 0;
+    note_upscaler(ex, cs);
     int blit = mvk_upscale_blit(ex, cs);
     int dlss = blit ? 0 : dlss_upscale(ex, cs);
     if (dlss) vk_exec_draw_new_cb(), ex->dirty = VK_EXEC_DIRTY_ALL;   // NGX left its own pipeline, descriptors and state

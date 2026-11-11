@@ -114,9 +114,10 @@ tracked compatibility and renderer milestone through M15.26, including the spars
 memory-stability and indirect-draw work used by the validated Grand Prix build. Supply your own legally dumped
 ExeFS and RomFS; neither game content nor generated output is stored in Git.
 
-On Windows, set `MKW_GAME` to the extracted 1.8.0 update directory and run `BUILD-MKW.bat`. The builder uses this
-DKB source tree directly, generates the guest C under ignored `generated/`, packs or reuses the user's RomFS under
-ignored `build/`, and links `build/mkw180/dkb.exe`. Full prerequisites and operation are documented in
+On Windows, drag the extracted 1.8.0 update directory onto `BUILD-MKW-FROM-SCRATCH.bat`. It downloads its own tools
+without `winget` or a system Python, generates the guest C under ignored `generated/`, indexes the user's loose RomFS
+without copying or packing it, and links `build/mkw180/dkb.exe`. Developers with the prerequisites already installed
+can continue to set `MKW_GAME` and run `BUILD-MKW.bat`. Full operation is documented in
 [docs/mkw-build.md](docs/mkw-build.md).
 
 The toolchain is TotK Recomp's ([docs/building.md](docs/building.md)): MSYS2 UCRT64 Clang, Ninja, Python 3.12 and the

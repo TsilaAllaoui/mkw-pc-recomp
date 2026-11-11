@@ -113,6 +113,11 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_DESC] = "Experimental: the game's SDR picture with its highlights lifted on an HDR display. Needs HDR turned on in Windows (\"Use HDR\") or in a "
                          "Wayland compositor with colour management; without it the picture stays SDR. Applies after a "
                          "restart.",
+    [UI_MENU_HDR_NATIVE] = "Game's own HDR",
+    [UI_MENU_HDR_NATIVE_DESC] = "With HDR output on: the game renders its own HDR picture, as on the console, with "
+                                "highlights up to Peak brightness (the game stops at 1400 nits), instead of the lifted "
+                                "SDR one. FSR, SMAA and the colour adjustment are off in this mode. Applies after a "
+                                "restart.",
     [UI_MENU_HDR_PEAK] = "Peak brightness",
     [UI_MENU_HDR_PEAK_DESC] = "Your display's peak in nits; the brightest highlights stop there.",
     [UI_MENU_HDR_GAME] = "Game brightness",
@@ -329,6 +334,8 @@ static const char *const text_en[UI_TEXT_COUNT] = {
     [UI_MENU_OV_WINDOW] = "Window", [UI_MENU_OV_OUTPUT] = "Game image", [UI_MENU_OV_SCENE] = "3D scene",
     [UI_MENU_OV_SCALING] = "Scaling", [UI_MENU_OV_LIMIT] = "Frame limit", [UI_MENU_OV_PRESENT] = "Presentation",
     [UI_MENU_OV_FMT_SIZE] = "%ux%u", [UI_MENU_OV_FMT_SCENE] = "%ux%u, %.0f%%",
+    [UI_MENU_OV_FMT_UPSCALE] = "%ux%u -> %ux%u",
+    [UI_MENU_OV_NO_UPSCALER] = "no upscaler",
     [UI_MENU_OV_FMT_FSR] = "AMD FSR 1, sharpness %d%%", [UI_MENU_OV_SCALE_NONE] = "none (1:1)",
     [UI_MENU_OV_SCALE_BILINEAR] = "bilinear",
 };
@@ -425,6 +432,10 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_HDR_DESC] = "Экспериментально: SDR-картинка игры с поднятыми бликами на HDR-дисплее. Нужен включённый HDR в Windows («Использовать HDR») или "
                          "Wayland-композитор с управлением цветом; без него картинка остаётся SDR. Применяется после "
                          "перезапуска.",
+    [UI_MENU_HDR_NATIVE] = "Собственный HDR игры",
+    [UI_MENU_HDR_NATIVE_DESC] = "При включённом выводе HDR: игра сама строит HDR-картинку, как на консоли, с бликами до "
+                                "пиковой яркости (игра останавливается на 1400 нит), вместо поднятой SDR-картинки. FSR, "
+                                "SMAA и цветокоррекция в этом режиме выключены. Применяется после перезапуска.",
     [UI_MENU_HDR_PEAK] = "Пиковая яркость",
     [UI_MENU_HDR_PEAK_DESC] = "Пик вашего дисплея в нитах; самые яркие блики останавливаются на нём.",
     [UI_MENU_HDR_GAME] = "Яркость игры",
@@ -643,6 +654,8 @@ static const char *const text_ru[UI_TEXT_COUNT] = {
     [UI_MENU_OV_WINDOW] = "Окно", [UI_MENU_OV_OUTPUT] = "Изображение игры", [UI_MENU_OV_SCENE] = "3D-сцена",
     [UI_MENU_OV_SCALING] = "Масштабирование", [UI_MENU_OV_LIMIT] = "Лимит кадров", [UI_MENU_OV_PRESENT] = "Вывод кадров",
     [UI_MENU_OV_FMT_SIZE] = "%ux%u", [UI_MENU_OV_FMT_SCENE] = "%ux%u, %.0f%%",
+    [UI_MENU_OV_FMT_UPSCALE] = "%ux%u -> %ux%u",
+    [UI_MENU_OV_NO_UPSCALER] = "без апскейлера",
     [UI_MENU_OV_FMT_FSR] = "AMD FSR 1, резкость %d%%", [UI_MENU_OV_SCALE_NONE] = "нет (1:1)",
     [UI_MENU_OV_SCALE_BILINEAR] = "билинейное",
 };

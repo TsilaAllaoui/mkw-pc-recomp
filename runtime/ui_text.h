@@ -51,7 +51,7 @@ typedef enum {
     UI_MENU_COLOR_BRIGHTNESS, UI_MENU_COLOR_BRIGHTNESS_DESC, UI_MENU_COLOR_CONTRAST, UI_MENU_COLOR_CONTRAST_DESC,
     UI_MENU_COLOR_SATURATION, UI_MENU_COLOR_SATURATION_DESC, UI_MENU_COLOR_GAMMA, UI_MENU_COLOR_GAMMA_DESC,
     UI_MENU_HDR_GROUP,        // group heading over the HDR rows
-    UI_MENU_HDR, UI_MENU_HDR_DESC, UI_MENU_HDR_PEAK, UI_MENU_HDR_PEAK_DESC, UI_MENU_HDR_GAME, UI_MENU_HDR_GAME_DESC,
+    UI_MENU_HDR, UI_MENU_HDR_DESC, UI_MENU_HDR_NATIVE, UI_MENU_HDR_NATIVE_DESC, UI_MENU_HDR_PEAK, UI_MENU_HDR_PEAK_DESC, UI_MENU_HDR_GAME, UI_MENU_HDR_GAME_DESC,
     UI_MENU_HDR_UI, UI_MENU_HDR_UI_DESC,
 
     // Game
@@ -177,6 +177,8 @@ typedef enum {
     UI_MENU_OV_WINDOW, UI_MENU_OV_OUTPUT, UI_MENU_OV_SCENE, UI_MENU_OV_SCALING, UI_MENU_OV_LIMIT, UI_MENU_OV_PRESENT,
     UI_MENU_OV_FMT_SIZE,      // "%ux%u"
     UI_MENU_OV_FMT_SCENE,     // "%ux%u, %.0f%%": the scene and its share of the game image's width
+    UI_MENU_OV_FMT_UPSCALE,   // "%ux%u -> %ux%u": the game's upscaler input and output (Bananza)
+    UI_MENU_OV_NO_UPSCALER,   // Bananza: the game ran no upscaler lately (its dynamic resolution reached the full size)
     UI_MENU_OV_FMT_FSR,       // "AMD FSR 1, sharpness %d%%"
     UI_MENU_OV_SCALE_NONE, UI_MENU_OV_SCALE_BILINEAR,
     UI_MENU_LAST_ID = UI_MENU_OV_SCALE_BILINEAR,

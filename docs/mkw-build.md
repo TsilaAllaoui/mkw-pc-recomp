@@ -1,11 +1,43 @@
 # Mario Kart World direct build, strict no-repack workflow
 
 This fork integrates the cumulative recompilation/runtime source through M15.26.
-Game data is supplied separately by the user. **BUILD-MKW.bat never calls a packer.**
+Game data is supplied separately by the user. Neither build batch file calls a packer.
 
-## One-command build
+## First-time build (no prerequisites or winget)
 
-From CMD in `G:\mkw-recomp`, run:
+On 64-bit Windows 10 or 11, drag the folder containing the extracted 1.8.0
+`exefs` and `romfs` onto `BUILD-MKW-FROM-SCRATCH.bat`, or double-click the BAT
+and paste the folder path. It downloads and installs the required tools, creates
+the Python environment, validates the dump, and builds the game. `winget`, a
+system Python installation, and the Vulkan SDK are not required.
+
+The downloads are the official MSYS2 self-extracting archive, Microsoft Visual
+Studio Build Tools bootstrapper, Microsoft's .NET install script, and Astral's
+`uv` install script. MSYS2 goes to `C:\msys64`; .NET, `uv`, managed Python and
+download caches stay under ignored `toolchain\`. Microsoft Build Tools supplies
+the linker and Windows SDK used by .NET NativeAOT; the game itself is compiled
+with MSYS2 UCRT64 Clang. Administrator approval is therefore required for the
+MSYS2 extraction and Microsoft Build Tools installation.
+
+The script is restartable. If a download, package install, generation step, or
+compile fails, correct the reported problem and run it again; valid tools and
+incremental build output are reused. Its safe default is four build jobs. Set
+`MKW_JOBS` before running it to choose another positive number.
+
+After the game-data-free self-test passes, launch:
+
+```text
+build\mkw180\dkb.exe
+```
+
+The executable has the dump's absolute paths embedded as defaults, so keep the
+dump where it was during the build. Rerun the BAT after moving it.
+
+## Existing developer setup
+
+`BUILD-MKW.bat` is the shorter incremental entry point for a machine which
+already has the prerequisites from [building.md](building.md). Set its paths or
+environment variables first, then run it from CMD:
 
 ```cmd
 BUILD-MKW.bat
@@ -52,7 +84,9 @@ If you want to force the loose-file mode without deleting the existing image,
 set `MKW_PACKED_ROMFS` to a nonexistent path before the build. Neither
 source file nor any large image is modified.
 
-`RUN-MKW.bat` uses the same default dump root if `MKW_GAME` is unset.
+`RUN-MKW.bat` uses the same developer-machine default dump root if `MKW_GAME`
+is unset. It is not needed for the from-scratch flow; `dkb.exe` can be launched
+directly.
 
 ## Artifacts and preservation
 
