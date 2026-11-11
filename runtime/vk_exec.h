@@ -148,6 +148,14 @@ int vk_exec_targets_recent(VkExec *ex, int any);
 // The current pass's targets with their formats, extents and the frames they were last rendered in (diagnostics).
 void vk_exec_targets_describe(VkExec *ex, char *buf, size_t cap);
 
+// upscaler = dlss (vk_dlss.c), from vk_exec_draw.c. vk_dlss_scene_draw: a draw about to be recorded with a depth
+// target; it notes the scene's depth and camera for the frame's evaluation. vk_dlss_jitter: sets j (pixels) to the
+// viewport offset of draws into depth when it is the scene depth DLSS last ran on; j stays as it is otherwise.
+// vk_dlss_image_gone: image is being destroyed (vk_exec_image_gone).
+void vk_dlss_scene_draw(const VkExec *ex);
+void vk_dlss_jitter(VkImage depth, float j[2]);
+void vk_dlss_image_gone(VkImage image);
+
 // TOTK_TRACE=gfx: replay counters of the current frame, logged and reset at each present (vk_exec_frame_log).
 typedef struct {
     uint64_t passes, draws_seen, draws, clears, copies, dispatches, submits;

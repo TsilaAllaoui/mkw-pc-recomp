@@ -289,6 +289,11 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
     return 1;
 }
 
+const void *vk_usnap_bytes(uint64_t addr, uint64_t n) {
+    VkDescriptorBufferInfo b;
+    return vk_usnap_find(addr, n, 1, &b) ? U.arena->map + b.offset : NULL;
+}
+
 void vk_usnap_drop(uint64_t addr, uint64_t n) {
     if (!U.mode || !n) return;
     if (U.nwr == U.cwr) U.wr = grow(U.wr, &U.cwr, sizeof *U.wr);

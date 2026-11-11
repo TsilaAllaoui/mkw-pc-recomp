@@ -18,6 +18,7 @@
 #include "fs.h"
 #include "gfx.h"
 #include "kernel.h"
+#include "input.h"
 #include "nvn_api.h"
 #include "platform/platform.h"
 #include "vk.h"
@@ -344,6 +345,7 @@ void rt_frame_presented(const tex_t *t, uint64_t n) {
     fflush(stderr);
     fs_save_flush();
     vk_pipeline_save();   // no-op without the Vulkan back end
+    input_script_report();
     prof_write();
     fflush(stderr);
     gfx_exit_release();

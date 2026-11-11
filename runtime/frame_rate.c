@@ -26,8 +26,9 @@
 // Its controller consumes an integer rate at patch page +12; its game clocks
 // consume the precise 60 Hz ratio at +8. The existing FPS limit sets the host cap.
 //
-// The world clock (frame_step_world_us) sums the steps from the first present that finds the player actor away from
-// the origin, where the title screen keeps it: the end of the first save load. Recorded and scripted input
+// The world clock (frame_step_world_us) sums the game time stepped (the patch page's step, whole vsyncs without the
+// real-time step) from the first present that finds the player actor away from the origin, where the title screen
+// keeps it: the end of the first save load (Bananza: the first present). Recorded and scripted input
 // (input.c) runs on it, so a replay presses at the same game time at any frame rate and after a first load of any
 // length; a later load (fast travel) still shifts what follows by its length.
 //
@@ -73,10 +74,16 @@ static void step_store(float seconds) {
 }
 
 static void frame_limit_live(void);
+static int no_table;   // this game version has no realtime patch table in this build
+// TOTK_FIXED_STEP=1 (with the real-time step): every present steps the game 1/60 s whatever its display time, so game
+// time is presents / 60 and a scripted run (input.c) steps the same game time per frame in every run. The game slows
+// down when frames take longer than 1/60 s and speeds up above 60 fps; meant for A/B and image tests.
+static int fixed_step;
 
 void frame_step_init(void) {
     int fps60 = rt_patch_set("fps60"), realtime = rt_patch_set("realtime"), cloth = rt_patch_set("cloth");
     if (realtime < 0) {
+        no_table = 1;
         rt_log("frame rate: no timing patch table; using the game's original frame timing");
         return;
     }
@@ -90,6 +97,12 @@ void frame_step_init(void) {
         if (!rt_game_version) dkb_rate = (_Atomic uint32_t *)((uint8_t *)rt_patch_page() + 12);
         step_store((float)STEP_FIRST_S);
     }
+    const char *fx = cfg_get("TOTK_FIXED_STEP");
+    if (fx && !strcmp(fx, "1")) {
+        fixed_step = step_word != NULL;
+        rt_log("frame rate: %s", fixed_step ? "fixed step, 1/60 s of game time per present (TOTK_FIXED_STEP=1)"
+               : "TOTK_FIXED_STEP=1 needs the real-time step (TOTK_REALTIME=1); the game keeps its own timing");
+    }
     frame_limit_live();   // TOTK_FPS_LIMIT decides the set fps60 from the start
     if (!rt_game_version) {
         rt_log("frame rate: Bananza %s", step_word ? "experimental dynamic step; host-paced frames" :
@@ -102,27 +115,30 @@ void frame_step_init(void) {
 
 int frame_step_realtime(void) { return step_word != NULL; }
 
-// The frame limit (menu, TOTK_FPS_LIMIT, live): 30, 60, 90, 120, 144, any whole rate from 30 to 360, or display (the
-// refresh rate of the window's monitor). Unset, the older TOTK_FPS60=0 still means 30. A limit of 30 switches the set
+// The frame limit (menu, TOTK_FPS_LIMIT, live): 30, 60, 90, 120, 144, any whole rate from 30 to 360, display (the
+// refresh rate of the window's monitor) or unlimited (no pacer wait: nvn_api_obj.c pace() treats the period 0 as
+// "present at once"; with TOTK_VK_PRESENT=fifo the display still caps the rate). Unset, the older TOTK_FPS60=0 still means 30. A limit of 30 switches the set
 // fps60 off (the shipping minimum interval 2), every other limit switches it on; the controller reads its minimum
 // interval from the patched sites each frame. With the real-time step the pacer holds frames to the limit; above 60
 // only the pacer changes, as the step has no lower bound. Without it the game steps whole 60 Hz vsyncs and the pacer
 // follows the game's interval, so the limit stops at 60.
 #define LIMIT_MIN_HZ 30
 #define LIMIT_MAX_HZ 360
+#define LIMIT_NONE (-2)   // limit_hz for unlimited; 0 is display and -1 is "not read yet"
 static int fps60_set = -2;
 static unsigned limit_seen;
 static int limit_read;
-static int limit_hz = -1;   // 0: display; -1 before the first read
+static int limit_hz = -1;   // 0: display; LIMIT_NONE: unlimited; -1 before the first read
 
 static int limit_parse(void) {
     const char *e = cfg_get("TOTK_FPS_LIMIT"), *old = cfg_get("TOTK_FPS60");
     if (!e || !*e) return old && !strcmp(old, "0") ? 30 : 60;
     if (!strcmp(e, "display")) return 0;
+    if (!strcmp(e, "unlimited")) return LIMIT_NONE;
     char *end;
     long n = strtol(e, &end, 10);
     if (!*end && n >= LIMIT_MIN_HZ && n <= LIMIT_MAX_HZ) return (int)n;
-    rt_log("frame rate: TOTK_FPS_LIMIT=%s is not 30..360 or display; 60", e);
+    rt_log("frame rate: TOTK_FPS_LIMIT=%s is not 30..360, display or unlimited; 60", e);
     return 60;
 }
 
@@ -136,8 +152,14 @@ static void frame_limit_live(void) {
     limit_hz = hz;
     if (fps60_set == -2) fps60_set = rt_patch_set("fps60");
     if (fps60_set >= 0) rt_patch_switch(fps60_set, hz != 30);
-    if ((hz > 60 || hz == 0) && !step_word)
+    if (hz == LIMIT_NONE) {
+        if (!step_word) rt_log("frame rate: unlimited needs the real-time step (TOTK_REALTIME=1); 60 fps");
+        else rt_log("frame rate: no limit (unlimited)%s", strcmp(cfg_value("TOTK_VK_PRESENT"), "fifo") ? "" :
+                    "; TOTK_VK_PRESENT=fifo still caps it at the monitor's rate, use mailbox or immediate");
+    } else if ((hz > 60 || hz == 0) && !step_word)
         rt_log("frame rate: limits above 60 need the real-time step (TOTK_REALTIME=1); 60 fps");
+    else if (hz && hz < 60 && no_table && !rt_game_version)
+        rt_log("frame rate: this game version has no real-time frame-rate support in this build; limit %d fps cannot be held", hz);
     else if (hz && hz < 60 && !step_word && !rt_game_version)
         // Bananza's own controller picks the present interval and the pacer follows it, so a lower limit is not held
         // without the real-time step (issue #118: a 30 fps limit still ran at 60).
@@ -149,17 +171,18 @@ static void frame_limit_live(void) {
 
 uint64_t frame_step_cap_ns(void) {
     frame_limit_live();
-    double hz = limit_hz ? limit_hz : gfx_window_refresh_hz();
+    if (limit_hz == LIMIT_NONE && step_word) return 0;   // pace() presents at once
+    double hz = limit_hz > 0 ? limit_hz : gfx_window_refresh_hz();
     if (hz < LIMIT_MIN_HZ) hz = 60;   // display rate unknown (no window yet)
     if (hz > LIMIT_MAX_HZ) hz = LIMIT_MAX_HZ;
     return (uint64_t)(1e9 / hz + 0.5);
 }
 
-// The frame rate the limit gives, for the performance overlay: the setting, the monitor's rate for "display", 60 at
+// The frame rate the limit gives, for the performance overlay: the setting, the monitor's rate for "display", 0 for unlimited, 60 at
 // most without the real-time step; 0 before the first frame read the setting.
 double frame_step_limit_hz(void) {
     int hz = limit_hz;
-    if (hz < 0) return 0;
+    if (hz < 0) return 0;   // not read yet, or unlimited: the overlay shows no limit
     double r = hz ? hz : gfx_window_refresh_hz();
     if (r < LIMIT_MIN_HZ) r = 60;
     return !step_word && r > 60 ? 60 : r > LIMIT_MAX_HZ ? LIMIT_MAX_HZ : r;
@@ -245,7 +268,10 @@ static uint64_t presents;
 int64_t frame_step_world_us(void) { return atomic_load_explicit(&world_us, memory_order_relaxed); }
 uint64_t frame_step_ticks(void) { return atomic_load_explicit(&game_us, memory_order_relaxed) * 60 / 1000000; }
 
-static void world_clock(double dt, double step) {
+// game: the game time this present stepped, the same amount frame_step_ticks adds. The world clock once summed the
+// display time without the real-time step and skipped the frames of a step reset (first frame, a long gap) with it,
+// so a load or a shader-compile stall moved every later timed script event by a few frames between runs.
+static void world_clock(double game) {
     presents++;
     int64_t w = atomic_load_explicit(&world_us, memory_order_relaxed);
     if (w < 0) {
@@ -260,14 +286,15 @@ static void world_clock(double dt, double step) {
         atomic_store_explicit(&world_us, 0, memory_order_relaxed);
         return;
     }
-    if (!step_word) step = dt > STEP_MAX_S ? STEP_MAX_S : dt;   // whole-vsync steps: the display time stands in
-    atomic_store_explicit(&world_us, w + (int64_t)(step * 1e6 + 0.5), memory_order_relaxed);
+    atomic_store_explicit(&world_us, w + (int64_t)(game * 1e6 + 0.5), memory_order_relaxed);
 }
 
 void frame_step_present(uint64_t display_ns, int interval) {
     frame_limit_live();
     double step = 0, dt = last_ns ? (double)(display_ns - last_ns) * 1e-9 : 0;
-    if (step_word && last_ns) {
+    if (step_word && fixed_step) {
+        step = STEP_FIRST_S;   // the patch page keeps the 1/60 s frame_step_init stored
+    } else if (step_word && last_ns) {
         if (dt > STEP_RESET_S || dt < 0.001) {
             sample_count = sample_next = 0;
         } else {
@@ -286,6 +313,6 @@ void frame_step_present(uint64_t display_ns, int interval) {
     double game = step_word ? step_now : (interval > 0 ? interval : 1) / 60.0;
     atomic_store_explicit(&game_us, atomic_load_explicit(&game_us, memory_order_relaxed) + (uint64_t)(game * 1e6 + 0.5),
                           memory_order_relaxed);
-    world_clock(dt, step);
+    world_clock(game);
     if (rt_trace & RT_TRACE_PERF) speed_report(display_ns, step, interval);
 }
